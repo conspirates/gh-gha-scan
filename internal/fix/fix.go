@@ -67,6 +67,8 @@ type Planner struct {
 	// Scanner checks candidate upgrades, with the same depth as the scan.
 	Scanner *scan.Scanner
 	Tags    TagLister
+	// Warnings collects problems found while checking candidate upgrades.
+	Warnings []string
 }
 
 type group struct {
@@ -148,6 +150,9 @@ type candidate struct {
 	clean bool
 	// blocker is an unpinned reference that remains in the newest release.
 	blocker string
+	// unverified means part of the release could not be read, so it is not
+	// known to be clean.
+	unverified bool
 }
 
 func upgradeKey(r ref.Ref) string { return strings.ToLower(r.Owner + "/" + r.Repo + "/" + r.Path) }
@@ -207,11 +212,15 @@ func (p *Planner) upgrades(ctx context.Context, roots []scan.Root, index map[str
 	if err != nil {
 		return nil, err
 	}
-	for _, c := range out {
-		c.clean = true
+	for k, c := range out {
+		c.clean = !res.Incomplete[k]
+		c.unverified = res.Incomplete[k]
+	}
+	for _, w := range res.Warnings {
+		p.Warnings = append(p.Warnings, "checking upgrades: "+w)
 	}
 	for _, f := range res.Findings {
-		if c := out[f.Repo]; c != nil && c.clean {
+		if c := out[f.Repo]; c != nil && c.blocker == "" {
 			c.clean = false
 			c.blocker = f.Uses
 		}
@@ -270,6 +279,8 @@ func describe(it *Item, root scan.Root, g *group, c *candidate) {
 	default:
 		it.FixKind = None
 		switch {
+		case c != nil && c.blocker == "" && c.unverified:
+			it.Fix = fmt.Sprintf("No verified fix: could not read all of latest release %s to check it (see warnings)", c.tag.Name)
 		case c == nil:
 			it.Fix = fmt.Sprintf("No fix upstream yet: %s has no releases and uses %s unpinned; fork it or ask upstream to pin", g.ref.Name(), nested[0].Uses)
 		default:

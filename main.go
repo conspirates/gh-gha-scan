@@ -145,6 +145,7 @@ func run(ctx context.Context, opts *options, args []string) error {
 	if err != nil {
 		return err
 	}
+	res.Warnings = append(res.Warnings, planner.Warnings...)
 
 	stats := client.Stats()
 	if opts.json {

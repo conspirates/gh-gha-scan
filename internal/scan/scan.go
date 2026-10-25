@@ -95,6 +95,9 @@ func (f Finding) IsTransitive() bool { return f.Uses != f.Direct.Uses }
 type Result struct {
 	Findings []Finding `json:"findings"`
 	Warnings []string  `json:"warnings"`
+	// Incomplete holds the names of roots with a reference that could not
+	// be read, so their findings may be missing some.
+	Incomplete map[string]bool `json:"-"`
 }
 
 // Scanner scans roots using Fetcher.
@@ -180,7 +183,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 		level = next
 	}
 
-	var res Result
+	res := Result{Incomplete: map[string]bool{}}
 	for i := range roots {
 		root := &roots[i]
 		for j, f := range root.Files {
@@ -341,11 +344,14 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 		}
 		res.Findings = append(res.Findings, f)
 	}
-	if depth >= sc.Depth || onPath[t.key] {
-		return
-	}
 	n := sc.nodes[t.key]
 	if n == nil {
+		if sc.missing[t.key] {
+			res.Incomplete[root.Name] = true
+		}
+		return
+	}
+	if depth >= sc.Depth || onPath[t.key] {
 		return
 	}
 	onPath[t.key] = true

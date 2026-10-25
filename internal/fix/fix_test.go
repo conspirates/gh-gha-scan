@@ -176,3 +176,38 @@ func TestLatest(t *testing.T) {
 		t.Error("tags without versions should give no candidate")
 	}
 }
+
+func TestUnreadableReleaseIsNotSuggested(t *testing.T) {
+	tags := fakeTags{"up/action": {{"v2.0.0", shaV2}}}
+	root := scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("up/action@v1")}}
+	tests := map[string]fakeFetcher{
+		// v2.0.0 has no action.yml at that path.
+		"missing action": {"up/action/@v1": {"actions/setup-go@v5"}},
+		// v2.0.0 uses a dependency that can't be read.
+		"missing dependency": {
+			"up/action/@v1":       {"actions/setup-go@v5"},
+			"up/action/@" + shaV2: {"gone/action@" + shaV1},
+		},
+	}
+	for name, f := range tests {
+		t.Run(name, func(t *testing.T) {
+			s := &scan.Scanner{Fetcher: f, Depth: 10, Resolve: true}
+			res, err := s.Scan(context.Background(), []scan.Root{root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := &Planner{Scanner: s, Tags: tags}
+			repos, err := p.Plan(context.Background(), []scan.Root{root}, res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			it := only(t, repos)
+			if it.FixKind != None || !strings.Contains(it.Fix, "could not read all of latest release v2.0.0") {
+				t.Errorf("got %+v", it)
+			}
+			if len(p.Warnings) == 0 || !strings.HasPrefix(p.Warnings[0], "checking upgrades: ") {
+				t.Errorf("warnings = %v, want the candidate's read failure", p.Warnings)
+			}
+		})
+	}
+}
