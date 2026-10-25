@@ -26,6 +26,11 @@ type Stats struct {
 	Cost      int    `json:"cost"`
 	Remaining int    `json:"remaining"`
 	ResetAt   string `json:"reset_at,omitempty"`
+	// Retries counts queries retried after a server error or a secondary
+	// rate limit, and RetryWait is the total time spent waiting for them.
+	Retries          int           `json:"retries"`
+	RetryWait        time.Duration `json:"-"`
+	RetryWaitSeconds float64       `json:"retry_wait_seconds"`
 }
 
 // Client talks to the GitHub API.
@@ -33,7 +38,8 @@ type Client struct {
 	gql  *api.GraphQLClient
 	rest *api.RESTClient
 	// Concurrency bounds parallel GraphQL queries. GitHub's secondary rate
-	// limits penalize parallel GraphQL, so keep it low.
+	// limits penalize parallel GraphQL, so keep it low; Stats counts the
+	// retries they cause.
 	Concurrency int
 
 	mu    sync.Mutex
@@ -61,14 +67,16 @@ func New() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{gql: gql, rest: rest, Concurrency: 2}, nil
+	return &Client{gql: gql, rest: rest, Concurrency: 4}, nil
 }
 
 // Stats returns API usage so far.
 func (c *Client) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.stats
+	s := c.stats
+	s.RetryWaitSeconds = s.RetryWait.Seconds()
+	return s
 }
 
 // minRemaining is the GraphQL budget below which the client stops instead of
@@ -94,6 +102,10 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 		if !retry {
 			break
 		}
+		c.mu.Lock()
+		c.stats.Retries++
+		c.stats.RetryWait += wait
+		c.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

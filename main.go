@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/cli/go-gh/v2/pkg/term"
@@ -181,6 +182,9 @@ func run(ctx context.Context, opts *options, args []string) error {
 		}
 		if cached != nil && cached.Hits > 0 {
 			msg += fmt.Sprintf(", %d cached files", cached.Hits)
+		}
+		if stats.Retries > 0 {
+			msg += fmt.Sprintf(", %d retries (waited %s)", stats.Retries, stats.RetryWait.Round(time.Second))
 		}
 		fmt.Fprintln(t.ErrOut(), msg)
 	}
