@@ -74,6 +74,19 @@ A repository shows `None (incomplete, see warnings)` instead of `None` when some
 
 Without `--exit-code`, a scan that runs exits 0 whatever it finds.
 
+## Rolling out the policy
+
+1. Scan the organization, including forks whose workflows run:
+   ```sh
+   gh gha-scan --owner my-org --include-forks --exit-code
+   ```
+2. Apply the Fix column, and resolve every warning behind a `None (incomplete, see warnings)`. For "No fix upstream yet", fork the action, replace it, or ask upstream to pin.
+3. Scan again once the fixes are on the default branches. Continue only when it exits **0**: exit 2 means part of the organization isn't known to be safe.
+4. Turn the policy on for a few repositories first. It can be set per repository (Settings → Actions → General) as well as for the organization. Good pilots are repositories whose fixes were inside composite actions or reusable workflows.
+5. Turn it on for the organization. To roll back, turn the setting off.
+
+A blocked workflow fails when its run starts. Push and pull request workflows show problems right away, but scheduled, release and `workflow_dispatch` workflows only fail at their next run, so rely on a clean scan rather than on nothing having failed yet. Once the policy is on, GitHub rejects any new unpinned ref by itself.
+
 ## What counts
 
 - `owner/repo[/path]@ref` and `owner/repo/.github/workflows/x.yml@ref` are findings unless `ref` is a full 40-character SHA. Short SHAs, tags and branches all count.
@@ -81,6 +94,8 @@ Without `--exit-code`, a scan that runs exits 0 whatever it finds.
 - `$/path` refs (same repository, at the running commit) aren't findings either. They're read from the repository of the file they're written in: the scanned repository itself, or the dependency at the ref it was called with. A `$/` ref with `@ref` is invalid.
 - `docker://` images are ignored, since the policy covers actions only.
 - Only top-level `.github/workflows/*.yml` and `*.yaml` files are scanned, as GitHub only runs those.
+- Only each repository's default branch is scanned. A workflow that runs from another branch, e.g. a long-lived release branch, may still use unpinned refs; scan that branch's checkout with `--local`.
+- A fork used as an action or reusable workflow is always followed, like any other dependency. `--include-forks` only decides whether a fork's own workflows are scanned.
 - With `--include-forks`, a fork's workflow files are only scanned if GitHub would run them: their state must be `active`. Files in a fork where Actions was never enabled aren't registered at all and are skipped too. Skipped files are listed with their state, e.g. `disabled_fork` or `not_registered`. This costs one REST call per fork.
 
 ## Cost
