@@ -1,0 +1,16 @@
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.1.0
+      - uses: "actions/setup-go@v5"
+  other:
+    steps:
+      - uses: ./.github/actions/local
+      - uses: docker://alpine:3.20
+  call:
+    uses: octo/reusable/.github/workflows/build.yml@main
