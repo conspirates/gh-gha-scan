@@ -457,3 +457,42 @@ func TestInvalidUsesMarksIncomplete(t *testing.T) {
 		t.Errorf("incomplete = %v, warnings = %v, findings = %+v; want incomplete with two warnings", res.Incomplete, res.Warnings, briefs(res.Findings))
 	}
 }
+
+func TestUnparsableRootFileMarksIncomplete(t *testing.T) {
+	// From the fixture in issue #2.
+	broken := File{Path: ".github/workflows/broken.yml", Text: "on: push\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n     bad: [indent\n"}
+	s := &Scanner{Fetcher: &fakeFetcher{}, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{Name: "o/r", Files: []File{broken}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Incomplete["o/r"] || len(res.Warnings) != 1 {
+		t.Errorf("incomplete = %v, warnings = %v; want incomplete with one warning", res.Incomplete, res.Warnings)
+	}
+}
+
+// brokenFetcher serves an unparsable file for every request.
+type brokenFetcher struct{}
+
+func (brokenFetcher) Fetch(_ context.Context, reqs map[string]FileReq) (map[string]FileRes, error) {
+	out := map[string]FileRes{}
+	for k, req := range reqs {
+		out[k] = FileRes{Found: true, Path: req.Paths[0], Text: "runs:\n  steps: [unclosed\n"}
+	}
+	return out, nil
+}
+
+func TestUnparsableFetchedFileMarksIncomplete(t *testing.T) {
+	s := &Scanner{Fetcher: brokenFetcher{}, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{
+		{Name: "o/one", Files: []File{workflowFile("ext/a@" + pinned)}},
+		{Name: "o/two", Files: []File{workflowFile("ext/a@" + pinned)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The file is parsed once, but every repository that uses it is affected.
+	if !res.Incomplete["o/one"] || !res.Incomplete["o/two"] || len(res.Warnings) != 1 {
+		t.Errorf("incomplete = %v, warnings = %v; want both incomplete with one warning", res.Incomplete, res.Warnings)
+	}
+}

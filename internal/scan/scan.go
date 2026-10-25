@@ -118,6 +118,8 @@ type node struct {
 	repo, path, at string
 	uses           []workflow.Use
 	sha            string
+	// unparsed means the file could not be parsed, so uses may be missing.
+	unparsed bool
 }
 
 // loc locates n for Finding.Source and Direct.File. A file in root's own
@@ -150,6 +152,7 @@ type scanner struct {
 // Scan scans roots.
 func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}, warned: map[string]bool{}}
+	res := Result{Incomplete: map[string]bool{}}
 
 	rootUses := make([][][]workflow.Use, len(roots))
 	var level []target
@@ -160,6 +163,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 			uses, err := workflow.Extract([]byte(f.Text))
 			if err != nil {
 				sc.warn("%s: %s: %v", root.Name, f.Path, err)
+				res.Incomplete[root.Name] = true
 				continue
 			}
 			rootUses[i][j] = uses
@@ -194,7 +198,6 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 		level = next
 	}
 
-	res := Result{Incomplete: map[string]bool{}}
 	for i := range roots {
 		root := &roots[i]
 		for j, f := range root.Files {
@@ -335,6 +338,7 @@ func (sc *scanner) addNode(key string, n *node, data []byte) {
 	uses, err := workflow.Extract(data)
 	if err != nil {
 		sc.warn("%s: %v", n.loc(&Root{}), err)
+		n.unparsed = true
 	}
 	n.uses = uses
 	sc.nodes[key] = n
@@ -389,6 +393,9 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 			res.Incomplete[root.Name] = true
 		}
 		return
+	}
+	if n.unparsed {
+		res.Incomplete[root.Name] = true
 	}
 	if onPath[t.key] {
 		return
