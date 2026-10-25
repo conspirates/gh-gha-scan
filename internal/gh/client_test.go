@@ -165,3 +165,133 @@ func TestRefsTellsBranchesFromTags(t *testing.T) {
 		t.Errorf("branches = %v, want %v", rr.Branches, want)
 	}
 }
+
+// graphQLQuery returns the query of a GraphQL request.
+func graphQLQuery(r *http.Request) string {
+	var body struct{ Query string }
+	b, _ := io.ReadAll(r.Body)
+	_ = json.Unmarshal(b, &body)
+	return body.Query
+}
+
+func reply(w http.ResponseWriter, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(body))
+}
+
+func fileReq(repo string) scan.FileReq {
+	owner, name, _ := strings.Cut(repo, "/")
+	return scan.FileReq{Owner: owner, Repo: name, Ref: "v1", Paths: []string{"action.yml"}}
+}
+
+func TestFetchFailsOnlyTheRefThatCantBeRead(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		reply(w, `{"data":{"rateLimit":{"cost":1,"remaining":4999},
+			"r0":{"f0":{"text":"runs: {using: node20}","isTruncated":false,"isBinary":false}},
+			"r1":null,"r2":null},
+			"errors":[
+				{"type":"FORBIDDEN","path":["r1"],"message":"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization."},
+				{"type":"NOT_FOUND","path":["r2"],"message":"Could not resolve to a Repository with the name 'c/gone'."}]}`)
+	})
+	got, err := c.Fetch(context.Background(), map[string]scan.FileReq{
+		"a": fileReq("a/ok"), "b": fileReq("sso/locked"), "c": fileReq("c/gone"),
+	})
+	if err != nil {
+		t.Fatalf("Fetch failed the whole batch: %v", err)
+	}
+	if !got["a"].Found {
+		t.Errorf("a = %+v, want found", got["a"])
+	}
+	if want := "the sso organization requires SAML single sign-on"; !strings.Contains(got["b"].Err, want) {
+		t.Errorf("b.Err = %q, want it to contain %q", got["b"].Err, want)
+	}
+	if !strings.Contains(got["c"].Err, "Could not resolve") {
+		t.Errorf("c.Err = %q", got["c"].Err)
+	}
+}
+
+func TestFetchSplitsABatchRejectedWhole(t *testing.T) {
+	// GitHub rejects any query asking for both a/big and b/ok, e.g. for its
+	// cost, and a/big even on its own.
+	var queries int
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		queries++
+		q := graphQLQuery(r)
+		if strings.Contains(q, `"big"`) {
+			reply(w, `{"errors":[{"type":"MAX_NODE_LIMIT_EXCEEDED","message":"too big"}]}`)
+			return
+		}
+		reply(w, `{"data":{"rateLimit":{"cost":1,"remaining":4999},"r0":{"f0":{"text":"runs: {}","isTruncated":false,"isBinary":false}}}}`)
+	})
+	got, err := c.Fetch(context.Background(), map[string]scan.FileReq{"big": fileReq("a/big"), "ok": fileReq("b/ok")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got["ok"].Found || got["big"].Err != "GraphQL: too big" {
+		t.Errorf("ok = %+v, big = %+v; want ok found and big failed alone", got["ok"], got["big"])
+	}
+	if queries != 3 {
+		t.Errorf("%d queries, want the batch and each half (3)", queries)
+	}
+}
+
+func TestFetchDoesNotSplitAnOutage(t *testing.T) {
+	var queries int
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		queries++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	_, err := c.Fetch(context.Background(), map[string]scan.FileReq{"a": fileReq("a/a"), "b": fileReq("b/b")})
+	if err == nil {
+		t.Fatal("want the outage as an error")
+	}
+	if queries != maxAttempts {
+		t.Errorf("%d queries, want %d: retries of one batch, no split", queries, maxAttempts)
+	}
+}
+
+func TestOwnerReposKeepsReposThatCantBeRead(t *testing.T) {
+	const listing = `{"data":{"rateLimit":{"cost":1,"remaining":4999},"repositoryOwner":{
+		"forks":{"totalCount":0},
+		"repositories":{"pageInfo":{"hasNextPage":false},"nodes":[
+			{"nameWithOwner":"o/big","defaultBranchRef":{"target":{"oid":"c1"}}},
+			{"nameWithOwner":"o/locked","defaultBranchRef":{"target":{"oid":"c2"}}}]}}}}`
+	// o/big has a truncated workflow file whose REST fallback fails, and
+	// o/locked can't be read at all.
+	const workflows = `{"data":{"rateLimit":{"cost":1,"remaining":4998},
+		"r0":{"object":{"entries":[
+			{"name":"build #2.yml","type":"blob","object":{"text":"","isTruncated":true,"isBinary":false}},
+			{"name":"ok.yml","type":"blob","object":{"text":"jobs: {}","isTruncated":false,"isBinary":false}}]}},
+		"r1":null},
+		"errors":[{"type":"FORBIDDEN","path":["r1"],"message":"Resource not accessible by integration"}]}`
+	var restPath string
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			restPath = r.URL.EscapedPath()
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if strings.Contains(graphQLQuery(r), "repositoryOwner") {
+			reply(w, listing)
+		} else {
+			reply(w, workflows)
+		}
+	})
+	repos, _, err := c.OwnerRepos(context.Background(), "o", false, false)
+	if err != nil {
+		t.Fatalf("OwnerRepos failed the whole scan: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("got %d repos, want both", len(repos))
+	}
+	big, locked := repos[0], repos[1]
+	if big.Err == "" || len(big.Files) != 1 || big.Files[0].Path != ".github/workflows/ok.yml" {
+		t.Errorf("o/big = %+v; want ok.yml read and an error for build #2.yml", big)
+	}
+	if want := "/repos/o/big/contents/.github/workflows/build%20%232.yml"; restPath != want {
+		t.Errorf("REST path = %q, want %q", restPath, want)
+	}
+	if locked.Err != "Resource not accessible by integration" {
+		t.Errorf("o/locked = %+v, want its error", locked)
+	}
+}

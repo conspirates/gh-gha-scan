@@ -55,6 +55,9 @@ type Root struct {
 	HeadOID string
 	// Local roots: reads a file relative to the checkout for ./local refs.
 	ReadLocal func(path string) ([]byte, error)
+	// Err says why some of the root's workflow files couldn't be read, so
+	// Files may be missing some.
+	Err string
 }
 
 // Finding is one unpinned reference.
@@ -173,6 +176,10 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 	var level []target
 	for i := range roots {
 		root := &roots[i]
+		if root.Err != "" {
+			sc.warn("%s: %s", root.Name, root.Err)
+			res.Incomplete[root.Name] = true
+		}
 		rootUses[i] = make([][]workflow.Use, len(root.Files))
 		for j, f := range root.Files {
 			uses, err := workflow.Extract([]byte(f.Text))

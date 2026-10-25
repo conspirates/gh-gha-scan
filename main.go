@@ -284,6 +284,7 @@ func remoteRoot(r gh.Repo) scan.Root {
 		Files:   r.Files,
 		Repo:    r.NameWithOwner,
 		HeadOID: r.HeadOID,
+		Err:     r.Err,
 	}
 }
 

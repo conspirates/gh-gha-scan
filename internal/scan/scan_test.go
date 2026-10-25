@@ -594,3 +594,14 @@ func TestSourceOwnerAndBoundary(t *testing.T) {
 		t.Errorf("z: boundary = %+v, want %+v; direct = %+v", z.Boundary, wantB, z.Direct)
 	}
 }
+
+func TestRootReadErrorMarksIncomplete(t *testing.T) {
+	s := &Scanner{Fetcher: &fakeFetcher{}, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{Name: "o/r", Err: "read o/r/.github/workflows/x.yml: HTTP 403", Files: []File{workflowFile()}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Incomplete["o/r"] || len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "HTTP 403") {
+		t.Errorf("incomplete = %v, warnings = %v", res.Incomplete, res.Warnings)
+	}
+}

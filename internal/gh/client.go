@@ -56,6 +56,8 @@ type Repo struct {
 	IsFork        bool
 	HeadOID       string
 	Files         []scan.File
+	// Err says why the workflow files could not all be read.
+	Err string
 }
 
 // New returns a client authenticated the way gh is.
@@ -132,30 +134,6 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 		}
 	}
 	return err
-}
-
-func isServerError(err error) bool {
-	var he *api.HTTPError
-	return errors.As(err, &he) && he.StatusCode >= 500
-}
-
-// notFound returns the top-level aliases that GraphQL reported as not found
-// (or not accessible), and an error for anything else.
-func notFound(err error) (map[string]string, error) {
-	var ge *api.GraphQLError
-	if !errors.As(err, &ge) {
-		return nil, err
-	}
-	out := map[string]string{}
-	for _, e := range ge.Errors {
-		if e.Type != "NOT_FOUND" || len(e.Path) == 0 {
-			return nil, err
-		}
-		if alias, ok := e.Path[0].(string); ok {
-			out[alias] = e.Message
-		}
-	}
-	return out, nil
 }
 
 // RootCache keeps the top-level workflow files of repositories by commit.
@@ -278,45 +256,52 @@ func (c *Client) workflows(ctx context.Context, nodes []repoNode) (map[string]Re
 	return out, firstErr
 }
 
-// workflowsBatch reads one batch, splitting it when GitHub times out.
+// workflowsBatch reads one batch, in halves if GitHub rejects it whole. A
+// repository deleted since it was listed has no entry; one that can't be
+// read has Err set.
 func (c *Client) workflowsBatch(ctx context.Context, nodes []repoNode) ([]Repo, error) {
-	var resp map[string]*struct {
-		Object json.RawMessage `json:"object"`
-	}
-	err := c.do(ctx, workflowsQuery(nodes), nil, &resp)
-	if isServerError(err) && len(nodes) > 1 {
-		half := len(nodes) / 2
-		a, err := c.workflowsBatch(ctx, nodes[:half])
+	run := func(nodes []repoNode) ([]Repo, error) {
+		var resp map[string]*struct {
+			Object json.RawMessage `json:"object"`
+		}
+		errs, err := aliasErrors(c.do(ctx, workflowsQuery(nodes), nil, &resp))
 		if err != nil {
 			return nil, err
 		}
-		b, err := c.workflowsBatch(ctx, nodes[half:])
-		return append(a, b...), err
-	}
-	if _, err := notFound(err); err != nil {
-		return nil, err
-	}
-	var repos []Repo
-	for i, n := range nodes {
-		got := resp[fmt.Sprintf("r%d", i)]
-		if got == nil {
-			continue
-		}
-		if len(got.Object) > 0 {
-			if err := json.Unmarshal(got.Object, &n.Object); err != nil {
-				return nil, err
+		var repos []Repo
+		for i, n := range nodes {
+			alias := fmt.Sprintf("r%d", i)
+			got := resp[alias]
+			if got == nil {
+				if e, ok := errs[alias]; ok && e.typ != "NOT_FOUND" {
+					repos = append(repos, failedRepo(n, errors.New(e.message(ownerOf(n.NameWithOwner)))))
+				}
+				continue
 			}
+			if len(got.Object) > 0 {
+				if err := json.Unmarshal(got.Object, &n.Object); err != nil {
+					return nil, err
+				}
+			}
+			r := c.repo(ctx, n)
+			if c.Roots != nil && r.Err == "" {
+				c.Roots.StoreFiles(r.NameWithOwner, r.HeadOID, r.Files)
+			}
+			repos = append(repos, r)
 		}
-		r, err := c.repo(ctx, n)
-		if err != nil {
-			return nil, err
-		}
-		if c.Roots != nil {
-			c.Roots.StoreFiles(r.NameWithOwner, r.HeadOID, r.Files)
-		}
-		repos = append(repos, r)
+		return repos, nil
 	}
-	return repos, nil
+	return inHalves(nodes, run, failedRepo)
+}
+
+// failedRepo is n with the reason its workflow files couldn't be read.
+func failedRepo(n repoNode, err error) Repo {
+	return Repo{NameWithOwner: n.NameWithOwner, IsFork: n.IsFork, HeadOID: n.oid(), Err: err.Error()}
+}
+
+func ownerOf(nameWithOwner string) string {
+	owner, _, _ := strings.Cut(nameWithOwner, "/")
+	return owner
 }
 
 // Repo returns one repository with its workflow files.
@@ -324,23 +309,28 @@ func (c *Client) Repo(ctx context.Context, owner, name string) (Repo, error) {
 	var resp struct {
 		Repository *repoNode `json:"repository"`
 	}
-	err := c.do(ctx, repoQuery, map[string]any{"owner": owner, "name": name}, &resp)
-	if _, nfErr := notFound(err); err != nil && nfErr != nil {
+	errs, err := aliasErrors(c.do(ctx, repoQuery, map[string]any{"owner": owner, "name": name}, &resp))
+	if err != nil {
 		return Repo{}, err
 	}
 	if resp.Repository == nil {
+		if e, ok := errs["repository"]; ok && e.typ != "NOT_FOUND" {
+			return Repo{}, fmt.Errorf("%s/%s: %s", owner, name, e.message(owner))
+		}
 		return Repo{}, fmt.Errorf("repository %s/%s not found", owner, name)
 	}
-	return c.repo(ctx, *resp.Repository)
+	return c.repo(ctx, *resp.Repository), nil
 }
 
-func (c *Client) repo(ctx context.Context, n repoNode) (Repo, error) {
+// repo reads n's workflow files. A file that can't be read sets Err; the
+// others are still returned.
+func (c *Client) repo(ctx context.Context, n repoNode) Repo {
 	r := Repo{NameWithOwner: n.NameWithOwner, IsFork: n.IsFork}
 	if n.DefaultBranchRef != nil {
 		r.HeadOID = n.DefaultBranchRef.Target.OID
 	}
 	if n.Object == nil {
-		return r, nil
+		return r
 	}
 	for _, e := range n.Object.Entries {
 		// GitHub only runs workflow files directly in .github/workflows.
@@ -350,11 +340,14 @@ func (c *Client) repo(ctx context.Context, n repoNode) (Repo, error) {
 		p := ".github/workflows/" + e.Name
 		text, err := c.text(ctx, n.NameWithOwner, r.HeadOID, p, e.Object)
 		if err != nil {
-			return Repo{}, err
+			if r.Err == "" {
+				r.Err = err.Error()
+			}
+			continue
 		}
 		r.Files = append(r.Files, scan.File{Path: p, Text: text})
 	}
-	return r, nil
+	return r
 }
 
 // text returns a blob's text, falling back to REST for blobs GraphQL truncated.
@@ -362,7 +355,11 @@ func (c *Client) text(ctx context.Context, repo, commit, p string, b *blob) (str
 	if b.Text != nil && !b.IsTruncated {
 		return *b.Text, nil
 	}
-	endpoint := fmt.Sprintf("repos/%s/contents/%s?ref=%s", repo, p, url.QueryEscape(commit))
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	endpoint := fmt.Sprintf("repos/%s/contents/%s?ref=%s", repo, strings.Join(segs, "/"), url.QueryEscape(commit))
 	resp, err := c.rest.RequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("read %s/%s: %w", repo, p, err)
@@ -410,14 +407,16 @@ func (c *Client) Refs(ctx context.Context, repos map[string][]string) (map[strin
 		names = append(names, r)
 	}
 	sort.Strings(names)
-	out := map[string]fix.RepoRefs{}
-	for start := 0; start < len(names); start += BatchSize {
-		chunk := names[start:min(start+BatchSize, len(names))]
+	type result struct {
+		repo string
+		refs *fix.RepoRefs
+	}
+	run := func(chunk []string) ([]result, error) {
 		var resp map[string]map[string]json.RawMessage
-		err := c.do(ctx, tagsQuery(chunk, repos), nil, &resp)
-		if _, err := notFound(err); err != nil {
+		if _, err := aliasErrors(c.do(ctx, tagsQuery(chunk, repos), nil, &resp)); err != nil {
 			return nil, err
 		}
+		var out []result
 		for i, r := range chunk {
 			repo := resp[fmt.Sprintf("t%d", i)]
 			if repo == nil {
@@ -452,7 +451,20 @@ func (c *Client) Refs(ctx context.Context, repos map[string][]string) (map[strin
 					rr.Branches[name] = head.Target.OID
 				}
 			}
-			out[strings.ToLower(r)] = rr
+			out = append(out, result{r, &rr})
+		}
+		return out, nil
+	}
+	out := map[string]fix.RepoRefs{}
+	for start := 0; start < len(names); start += BatchSize {
+		got, err := inHalves(names[start:min(start+BatchSize, len(names))], run, func(r string, _ error) result { return result{repo: r} })
+		if err != nil {
+			return nil, err
+		}
+		for _, g := range got {
+			if g.refs != nil {
+				out[strings.ToLower(g.repo)] = *g.refs
+			}
 		}
 	}
 	return out, nil
@@ -495,53 +507,67 @@ func (c *Client) Fetch(ctx context.Context, reqs map[string]scan.FileReq) (map[s
 	return out, firstErr
 }
 
+// fetchBatch reads one batch, in halves if GitHub rejects it whole. A
+// repository or file that can't be read fails only its own request.
 func (c *Client) fetchBatch(ctx context.Context, keys []string, all map[string]scan.FileReq) (map[string]scan.FileRes, error) {
-	reqs := make([]scan.FileReq, len(keys))
-	for i, k := range keys {
-		reqs[i] = all[k]
+	type result struct {
+		key string
+		res scan.FileRes
 	}
-	var resp map[string]json.RawMessage
-	err := c.do(ctx, batchQuery(reqs), nil, &resp)
-	missing, err := notFound(err)
+	run := func(keys []string) ([]result, error) {
+		reqs := make([]scan.FileReq, len(keys))
+		for i, k := range keys {
+			reqs[i] = all[k]
+		}
+		var resp map[string]json.RawMessage
+		errs, err := aliasErrors(c.do(ctx, batchQuery(reqs), nil, &resp))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]result, len(keys))
+		for i, k := range keys {
+			req, alias := reqs[i], fmt.Sprintf("r%d", i)
+			out[i].key = k
+			var objs map[string]json.RawMessage
+			if raw := resp[alias]; len(raw) > 0 {
+				_ = json.Unmarshal(raw, &objs)
+			}
+			if objs == nil {
+				out[i].res = scan.FileRes{Err: errs[alias].message(req.Owner)}
+				continue
+			}
+			var res scan.FileRes
+			for j, p := range req.Paths {
+				var b *blob
+				_ = json.Unmarshal(objs[fmt.Sprintf("f%d", j)], &b)
+				if b == nil || b.IsBinary {
+					continue
+				}
+				text, err := c.text(ctx, req.Owner+"/"+req.Repo, req.Ref, p, b)
+				if err != nil {
+					res = scan.FileRes{Err: err.Error()}
+					break
+				}
+				res = scan.FileRes{Found: true, Path: p, Text: text}
+				break
+			}
+			if req.Resolve {
+				var o *object
+				_ = json.Unmarshal(objs["c"], &o)
+				res.SHA = o.commit()
+			}
+			out[i].res = res
+		}
+		return out, nil
+	}
+	failed := func(k string, err error) result { return result{k, scan.FileRes{Err: err.Error()}} }
+	got, err := inHalves(keys, run, failed)
 	if err != nil {
 		return nil, err
 	}
-
-	out := make(map[string]scan.FileRes, len(keys))
-	for i, k := range keys {
-		req, alias := reqs[i], fmt.Sprintf("r%d", i)
-		var objs map[string]json.RawMessage
-		if raw := resp[alias]; len(raw) > 0 {
-			_ = json.Unmarshal(raw, &objs)
-		}
-		if objs == nil {
-			msg := "repository not found or not accessible"
-			if m, ok := missing[alias]; ok && m != "" {
-				msg = m
-			}
-			out[k] = scan.FileRes{Err: msg}
-			continue
-		}
-		var res scan.FileRes
-		for j, p := range req.Paths {
-			var b *blob
-			_ = json.Unmarshal(objs[fmt.Sprintf("f%d", j)], &b)
-			if b == nil || b.IsBinary {
-				continue
-			}
-			text, err := c.text(ctx, req.Owner+"/"+req.Repo, req.Ref, p, b)
-			if err != nil {
-				return nil, err
-			}
-			res = scan.FileRes{Found: true, Path: p, Text: text}
-			break
-		}
-		if req.Resolve {
-			var o *object
-			_ = json.Unmarshal(objs["c"], &o)
-			res.SHA = o.commit()
-		}
-		out[k] = res
+	out := make(map[string]scan.FileRes, len(got))
+	for _, g := range got {
+		out[g.key] = g.res
 	}
 	return out, nil
 }
