@@ -423,13 +423,17 @@ func (c *Client) WorkflowStates(ctx context.Context, repo string) (map[string]st
 	}
 }
 
-// Tags implements fix.TagLister with batched GraphQL queries. Repositories
+// Refs implements fix.RefLister with batched GraphQL queries. Repositories
 // that cannot be read have no entry.
-func (c *Client) Tags(ctx context.Context, repos []string) (map[string][]fix.Tag, error) {
-	out := map[string][]fix.Tag{}
+func (c *Client) Refs(ctx context.Context, repos []string) (map[string]fix.RepoRefs, error) {
+	out := map[string]fix.RepoRefs{}
 	for start := 0; start < len(repos); start += BatchSize {
 		chunk := repos[start:min(start+BatchSize, len(repos))]
 		var resp map[string]*struct {
+			DefaultBranchRef *struct {
+				Name   string `json:"name"`
+				Target object `json:"target"`
+			} `json:"defaultBranchRef"`
 			Refs struct {
 				Nodes []tagNode `json:"nodes"`
 			} `json:"refs"`
@@ -443,9 +447,14 @@ func (c *Client) Tags(ctx context.Context, repos []string) (map[string][]fix.Tag
 			if repo == nil {
 				continue
 			}
-			for _, n := range repo.Refs.Nodes {
-				out[strings.ToLower(r)] = append(out[strings.ToLower(r)], fix.Tag{Name: n.Name, SHA: n.Target.commit()})
+			var rr fix.RepoRefs
+			if d := repo.DefaultBranchRef; d != nil {
+				rr.Default = fix.Tag{Name: d.Name, SHA: d.Target.OID}
 			}
+			for _, n := range repo.Refs.Nodes {
+				rr.Tags = append(rr.Tags, fix.Tag{Name: n.Name, SHA: n.Target.commit()})
+			}
+			out[strings.ToLower(r)] = rr
 		}
 	}
 	return out, nil

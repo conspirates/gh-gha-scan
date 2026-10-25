@@ -53,8 +53,9 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 | Fix | When |
 |---|---|
 | Pin to `<action>@<sha> # <version>` | The ref itself is unpinned and everything it uses is pinned. The SHA is the commit the current version points at, so behavior doesn't change. |
-| Upgrade to `<action>@<sha> # <version>` | The dependency uses unpinned refs, and its newest release (by version tag) is fully pinned. Marked when the major version changes. |
-| Pin `<ref>` in `<file>`, then update this reference | The dependency belongs to the same owner, so the refs inside it can be pinned directly. When the unpinned ref is inside a third-party action that the dependency calls, the step is instead to upgrade that action in the dependency's file, or there's no fix upstream yet. |
+| Upgrade to `<action>@<sha> # <version>` | The dependency uses unpinned refs, and its newest release (by version tag) is fully pinned. This applies to dependencies of the same owner too. Marked when the major version changes. |
+| Release `<action>` from `<branch>` at `<sha>`, then upgrade to it | A same-owner dependency's newest release isn't fully pinned, but its default branch is, so it only needs a release. |
+| Pin `<ref>` in `<file>:<line> on <branch>`, then update this reference | A same-owner dependency is fully pinned in neither its newest release nor its default branch, so the refs inside it have to be pinned. The locations are on its default branch, where the edit goes. When the unpinned ref is inside a third-party action that the dependency calls, the step is instead to upgrade that action there, or there's no fix upstream yet. |
 | No fix upstream yet | Even the newest release still uses unpinned refs: fork it, replace it, or ask upstream to pin. |
 | No verified fix | Part of the newest release couldn't be read, so it isn't known to be fully pinned. The warnings say what failed. |
 

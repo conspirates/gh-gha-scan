@@ -60,6 +60,7 @@ func TestTagsQuery(t *testing.T) {
 	for _, want := range []string{
 		`t0: repository(owner: "actions", name: "checkout")`,
 		`t1: repository(owner: "o", name: "r")`,
+		`defaultBranchRef { name target { oid } }`,
 		`refs(refPrefix: "refs/tags/", first: 50, orderBy: {field: TAG_COMMIT_DATE, direction: DESC})`,
 	} {
 		if !strings.Contains(q, want) {

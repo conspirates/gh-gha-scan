@@ -5,6 +5,7 @@ package fix
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,10 +20,20 @@ type Tag struct {
 	SHA  string
 }
 
-// TagLister lists the tags of repositories, keyed by lowercase owner/repo.
+// RepoRefs is what the planner needs to know about a dependency's
+// repository.
+type RepoRefs struct {
+	// Tags are the most recent tags.
+	Tags []Tag
+	// Default is the default branch, by name, and its head commit.
+	Default Tag
+}
+
+// RefLister looks up the refs of repositories (owner/repo), keyed by
+// lowercase owner/repo. Repositories that cannot be read have no entry.
 // Implementations should batch requests.
-type TagLister interface {
-	Tags(ctx context.Context, repos []string) (map[string][]Tag, error)
+type RefLister interface {
+	Refs(ctx context.Context, repos []string) (map[string]RepoRefs, error)
 }
 
 // Kind classifies a suggested fix.
@@ -70,7 +81,7 @@ type Repo struct {
 type Planner struct {
 	// Scanner checks candidate upgrades, with the same depth as the scan.
 	Scanner *scan.Scanner
-	Tags    TagLister
+	Refs    RefLister
 	// Warnings collects problems found while checking candidate upgrades.
 	Warnings []string
 }
@@ -97,7 +108,7 @@ func (p *Planner) Plan(ctx context.Context, repos []scan.Root, res scan.Result) 
 		g.findings = append(g.findings, f)
 	}
 
-	upgrades, err := p.upgrades(ctx, repos, index)
+	st, err := p.check(ctx, repos, index)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +123,7 @@ func (p *Planner) Plan(ctx context.Context, repos []scan.Root, res scan.Result) 
 				Line:     g.direct.Line,
 				Findings: g.findings,
 			}
-			describe(&it, root, g, upgrades)
+			describe(&it, root, g, st)
 			r.Items = append(r.Items, it)
 		}
 		sort.SliceStable(r.Items, func(i, j int) bool { return r.Items[i].Action < r.Items[j].Action })
@@ -154,95 +165,192 @@ func transitive(fs []scan.Finding) []scan.Finding {
 	return out
 }
 
-// candidate is the outcome of checking a dependency's newest release.
+// candidate is the outcome of checking one version of a dependency: its
+// latest release, or its default branch head.
 type candidate struct {
 	tag   Tag
 	clean bool
-	// blocker is an unpinned reference that remains in the newest release.
+	// blocker is an unpinned reference that remains in this version.
 	blocker string
-	// unverified means part of the release could not be read, so it is not
+	// unverified means part of this version could not be read, so it is not
 	// known to be clean.
 	unverified bool
+	// findings are the unpinned references inside this version.
+	findings []scan.Finding
 }
 
 func upgradeKey(r ref.Ref) string { return strings.ToLower(r.Owner + "/" + r.Repo + "/" + r.Path) }
 
-// upgrades checks the newest release of each external dependency that has
-// unpinned references inside it: one a repository calls directly, or one
-// called from a file in a same-owner dependency. Tags are listed in one
-// batch, and all candidates are scanned together.
-func (p *Planner) upgrades(ctx context.Context, roots []scan.Root, index map[string]*group) (map[string]*candidate, error) {
+func repoKey(r ref.Ref) string { return strings.ToLower(r.Owner + "/" + r.Repo) }
+
+func versionKey(r ref.Ref, sha string) string { return upgradeKey(r) + "@" + sha }
+
+// state is what the planner learned about dependencies.
+type state struct {
+	refs map[string]RepoRefs   // by repoKey
+	done map[string]*candidate // by versionKey
+}
+
+// release returns the check of r's latest release, or nil.
+func (st *state) release(r ref.Ref) *candidate {
+	t, ok := Latest(st.refs[repoKey(r)].Tags)
+	if !ok {
+		return nil
+	}
+	return st.done[versionKey(r, t.SHA)]
+}
+
+// head returns the check of r's default branch head, or nil.
+func (st *state) head(r ref.Ref) *candidate {
+	d := st.refs[repoKey(r)].Default
+	if d.SHA == "" {
+		return nil
+	}
+	return st.done[versionKey(r, d.SHA)]
+}
+
+// upstream returns the unpinned references inside g's same-owner dependency
+// where they have to be fixed: on its default branch when that could be
+// read, otherwise at the commit in use.
+func (st *state) upstream(g *group) (fs []scan.Finding, onDefault bool) {
+	if h := st.head(g.ref); h != nil && !h.unverified {
+		return h.findings, true
+	}
+	return transitive(g.findings), false
+}
+
+// wanted asks for a version of a dependency to be checked.
+type wanted struct {
+	ref ref.Ref
+	// head asks for the default branch head instead of the latest release.
+	head bool
+	// owner is the scanned repository's owner, so that findings inside a
+	// same-owner dependency know which files that owner controls.
+	owner string
+}
+
+// check checks the versions of dependencies that fixes may suggest: the
+// latest release of each dependency with unpinned references inside it,
+// and for a same-owner dependency also its default branch head. A
+// same-owner dependency that is fixed in neither is fixed on its default
+// branch, so the third-party actions it calls there are checked next.
+func (p *Planner) check(ctx context.Context, roots []scan.Root, index map[string]*group) (*state, error) {
+	st := &state{refs: map[string]RepoRefs{}, done: map[string]*candidate{}}
 	owners := map[string]string{}
 	for _, r := range roots {
 		owners[r.Name] = r.Owner
 	}
-	need := map[string]ref.Ref{}
-	repoSet := map[string]bool{}
+	ownerOf := func(k string) string { return owners[k[:strings.IndexByte(k, 0)]] }
+
+	var ws []wanted
 	for k, g := range index {
-		owner := owners[k[:strings.IndexByte(k, 0)]]
-		for _, f := range transitive(g.findings) {
-			r := g.ref
-			if sameOwner(owner, g.ref) {
-				if !f.SourceExternal {
-					continue
-				}
-				r = ref.Parse(f.Boundary.Uses)
-			}
-			need[upgradeKey(r)] = r
-			repoSet[strings.ToLower(r.Owner+"/"+r.Repo)] = true
+		if len(transitive(g.findings)) == 0 {
+			continue
+		}
+		owner := ownerOf(k)
+		ws = append(ws, wanted{ref: g.ref, owner: owner})
+		if sameOwner(owner, g.ref) {
+			ws = append(ws, wanted{ref: g.ref, head: true, owner: owner})
 		}
 	}
-	if len(need) == 0 {
-		return nil, nil
-	}
-
-	repos := make([]string, 0, len(repoSet))
-	for r := range repoSet {
-		repos = append(repos, r)
-	}
-	sort.Strings(repos)
-	tags, err := p.Tags.Tags(ctx, repos)
-	if err != nil {
+	if err := p.verify(ctx, st, ws); err != nil {
 		return nil, err
 	}
 
-	out := map[string]*candidate{}
-	var cands []scan.Root
-	for k, r := range need {
-		t, ok := Latest(tags[strings.ToLower(r.Owner+"/"+r.Repo)])
-		if !ok {
+	ws = nil
+	for k, g := range index {
+		owner := ownerOf(k)
+		if len(transitive(g.findings)) == 0 || !sameOwner(owner, g.ref) {
 			continue
 		}
-		c := &candidate{tag: t}
-		out[k] = c
-		pinned := ref.Ref{Kind: r.Kind, Owner: r.Owner, Repo: r.Repo, Path: r.Path, Ref: t.SHA}
-		cands = append(cands, scan.Root{Name: k, Files: []scan.File{probe(pinned)}})
+		if c := st.release(g.ref); c != nil && c.clean {
+			continue
+		}
+		if h := st.head(g.ref); h != nil && h.clean {
+			continue
+		}
+		fs, _ := st.upstream(g)
+		for _, f := range fs {
+			if f.SourceExternal {
+				ws = append(ws, wanted{ref: ref.Parse(f.Boundary.Uses), owner: owner})
+			}
+		}
 	}
-	if len(cands) == 0 {
-		return out, nil
+	if err := p.verify(ctx, st, ws); err != nil {
+		return nil, err
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i].Name < cands[j].Name })
+	return st, nil
+}
+
+// verify looks up the refs of repositories not seen yet, then scans every
+// wanted version not checked yet, all in one scan.
+func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
+	var repos []string
+	for _, w := range ws {
+		k := repoKey(w.ref)
+		if _, ok := st.refs[k]; !ok && !slices.Contains(repos, k) {
+			repos = append(repos, k)
+		}
+	}
+	if len(repos) > 0 {
+		sort.Strings(repos)
+		got, err := p.Refs.Refs(ctx, repos)
+		if err != nil {
+			return err
+		}
+		for _, k := range repos {
+			st.refs[k] = got[k]
+		}
+	}
+
+	cands := map[string]*candidate{}
+	var probes []scan.Root
+	for _, w := range ws {
+		rr := st.refs[repoKey(w.ref)]
+		t := rr.Default
+		if !w.head {
+			t, _ = Latest(rr.Tags)
+		}
+		if t.SHA == "" {
+			continue
+		}
+		k := versionKey(w.ref, t.SHA)
+		if st.done[k] != nil || cands[k] != nil {
+			continue
+		}
+		cands[k] = &candidate{tag: t}
+		pinned := ref.Ref{Kind: w.ref.Kind, Owner: w.ref.Owner, Repo: w.ref.Repo, Path: w.ref.Path, Ref: t.SHA}
+		probes = append(probes, scan.Root{Name: k, Owner: w.owner, Files: []scan.File{probe(pinned)}})
+	}
+	if len(probes) == 0 {
+		return nil
+	}
+	sort.Slice(probes, func(i, j int) bool { return probes[i].Name < probes[j].Name })
 
 	s := *p.Scanner
 	s.Resolve = false
-	res, err := s.Scan(ctx, cands)
+	res, err := s.Scan(ctx, probes)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	for k, c := range out {
-		c.clean = !res.Incomplete[k]
+	for k, c := range cands {
 		c.unverified = res.Incomplete[k]
+		c.clean = !c.unverified
+		st.done[k] = c
 	}
 	for _, w := range res.Warnings {
 		p.Warnings = append(p.Warnings, "checking upgrades: "+w)
 	}
 	for _, f := range res.Findings {
-		if c := out[f.Repo]; c != nil && c.blocker == "" {
+		if c := cands[f.Repo]; c != nil {
 			c.clean = false
-			c.blocker = f.Uses
+			c.findings = append(c.findings, f)
+			if c.blocker == "" {
+				c.blocker = f.Uses
+			}
 		}
 	}
-	return out, nil
+	return nil
 }
 
 // probe is a workflow that calls r, used to scan a candidate release.
@@ -259,9 +367,9 @@ func sameOwner(owner string, r ref.Ref) bool {
 	return owner != "" && strings.EqualFold(owner, r.Owner)
 }
 
-func describe(it *Item, root scan.Root, g *group, upgrades map[string]*candidate) {
+func describe(it *Item, root scan.Root, g *group, st *state) {
 	nested := transitive(g.findings)
-	c := upgrades[upgradeKey(g.ref)]
+	c := st.release(g.ref)
 	switch {
 	case len(nested) == 0:
 		it.FixKind = Pin
@@ -273,9 +381,6 @@ func describe(it *Item, root scan.Root, g *group, upgrades map[string]*candidate
 		it.Replacement = fmt.Sprintf("%s@%s # %s", g.ref.Name(), sha, g.ref.Ref)
 		it.Fix = "Pin to " + it.Replacement
 
-	case sameOwner(root.Owner, g.ref):
-		describeUpstream(it, nested, upgrades)
-
 	case c != nil && c.clean:
 		it.FixKind = Upgrade
 		it.Replacement = fmt.Sprintf("%s@%s # %s", g.ref.Name(), c.tag.SHA, c.tag.Name)
@@ -284,28 +389,54 @@ func describe(it *Item, root scan.Root, g *group, upgrades map[string]*candidate
 			it.Fix += fmt.Sprintf(" (major version change from %s)", cur)
 		}
 
+	case sameOwner(root.Owner, g.ref):
+		describeUpstream(it, g, st)
+
 	default:
 		it.FixKind = None
 		it.Fix = noFix(g.ref, c, nested[0].Uses)
 	}
 }
 
-// describeUpstream suggests fixes inside a same-owner dependency. A nested
-// reference in a file the owner controls is pinned there. One in a
-// third-party file can only be fixed through the reference to that third
-// party in the owner's file: upgrade it, or there is no fix yet.
-func describeUpstream(it *Item, nested []scan.Finding, upgrades map[string]*candidate) {
+// describeUpstream suggests fixes inside a same-owner dependency whose latest
+// release is not fully pinned. If its default branch is, that only needs a
+// release. Otherwise each nested reference is fixed on the default branch: in
+// a file the owner controls it is pinned there, and one in a third-party
+// file can only be fixed through the reference to that third party: upgrade
+// it, or there is no fix yet.
+func describeUpstream(it *Item, g *group, st *state) {
 	it.FixKind = PinUpstream
+	d := st.refs[repoKey(g.ref)].Default
+	if h := st.head(g.ref); h != nil && h.clean {
+		latest := "it has no releases yet"
+		if c := st.release(g.ref); c != nil {
+			latest = "latest release " + c.tag.Name + " isn't"
+		}
+		it.Fix = fmt.Sprintf("Release %s from %s at %s, which is fully pinned (%s), then upgrade to it", g.ref.Name(), d.Name, d.SHA[:7], latest)
+		return
+	}
+
+	nested, onDefault := st.upstream(g)
+	// loc shows a file at the default branch head by its branch, since that
+	// is where the edit goes.
+	loc := func(file string, line int) string {
+		if f, ok := strings.CutSuffix(file, "@"+d.SHA); ok && onDefault {
+			return fmt.Sprintf("%s:%d on %s", f, line, d.Name)
+		}
+		return fmt.Sprintf("%s:%d", file, line)
+	}
 	var steps []string
 	seen := map[string]bool{}
 	for _, f := range nested {
 		var s string
 		if !f.SourceExternal {
-			s = "Pin " + f.Uses + " in " + f.Source
+			i := strings.LastIndexByte(f.Source, ':')
+			line, _ := strconv.Atoi(f.Source[i+1:])
+			s = "Pin " + f.Uses + " in " + loc(f.Source[:i], line)
 		} else {
 			b := ref.Parse(f.Boundary.Uses)
-			at := fmt.Sprintf("%s in %s:%d", short(f.Boundary), f.Boundary.File, f.Boundary.Line)
-			if c := upgrades[upgradeKey(b)]; c != nil && c.clean {
+			at := short(f.Boundary) + " in " + loc(f.Boundary.File, f.Boundary.Line)
+			if c := st.release(b); c != nil && c.clean {
 				s = fmt.Sprintf("Upgrade %s to %s@%s # %s", at, b.Name(), c.tag.SHA, c.tag.Name)
 			} else {
 				it.FixKind = None

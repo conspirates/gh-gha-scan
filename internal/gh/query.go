@@ -98,13 +98,15 @@ func batchQuery(reqs []scan.FileReq) string {
 // when looking for a release to upgrade to.
 const TagsPerRepo = 50
 
-// tagsQuery lists recent tags of repos (owner/repo), aliased tN.
+// tagsQuery lists the default branch and recent tags of repos (owner/repo),
+// aliased tN.
 func tagsQuery(repos []string) string {
 	var b strings.Builder
 	b.WriteString("query {\n  " + rateLimitField + "\n")
 	for i, r := range repos {
 		owner, name, _ := strings.Cut(r, "/")
 		fmt.Fprintf(&b, "  t%d: repository(owner: %s, name: %s) {\n", i, quote(owner), quote(name))
+		b.WriteString("    defaultBranchRef { name target { oid } }\n")
 		fmt.Fprintf(&b, "    refs(refPrefix: \"refs/tags/\", first: %d, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {\n", TagsPerRepo)
 		b.WriteString("      nodes { name target { oid ... on Tag { target { oid ... on Tag { target { oid } } } } } }\n")
 		b.WriteString("    }\n  }\n")

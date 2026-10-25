@@ -38,13 +38,27 @@ func (f fakeFetcher) Fetch(_ context.Context, reqs map[string]scan.FileReq) (map
 	return out, nil
 }
 
+// fakeTags serves tags only, with no default branch.
 type fakeTags map[string][]Tag
 
-func (f fakeTags) Tags(_ context.Context, repos []string) (map[string][]Tag, error) {
-	out := map[string][]Tag{}
+func (f fakeTags) Refs(_ context.Context, repos []string) (map[string]RepoRefs, error) {
+	out := map[string]RepoRefs{}
 	for _, r := range repos {
 		if ts, ok := f[r]; ok {
-			out[r] = ts
+			out[r] = RepoRefs{Tags: ts}
+		}
+	}
+	return out, nil
+}
+
+// fakeRefs serves tags and default branches.
+type fakeRefs map[string]RepoRefs
+
+func (f fakeRefs) Refs(_ context.Context, repos []string) (map[string]RepoRefs, error) {
+	out := map[string]RepoRefs{}
+	for _, r := range repos {
+		if rr, ok := f[r]; ok {
+			out[r] = rr
 		}
 	}
 	return out, nil
@@ -58,14 +72,17 @@ func workflow(uses ...string) scan.File {
 	return scan.File{Path: ".github/workflows/ci.yml", Text: text}
 }
 
-func plan(t *testing.T, f fakeFetcher, tags fakeTags, roots ...scan.Root) []Repo {
+func plan(t *testing.T, f fakeFetcher, refs RefLister, roots ...scan.Root) []Repo {
 	t.Helper()
+	if refs == nil {
+		refs = fakeTags{}
+	}
 	s := &scan.Scanner{Fetcher: f, Depth: 10, Resolve: true}
 	res, err := s.Scan(context.Background(), roots)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := (&Planner{Scanner: s, Tags: tags}).Plan(context.Background(), roots, res)
+	out, err := (&Planner{Scanner: s, Refs: refs}).Plan(context.Background(), roots, res)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +213,7 @@ func TestUnreadableReleaseIsNotSuggested(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			p := &Planner{Scanner: s, Tags: tags}
+			p := &Planner{Scanner: s, Refs: tags}
 			repos, err := p.Plan(context.Background(), []scan.Root{root}, res)
 			if err != nil {
 				t.Fatal(err)
@@ -249,5 +266,65 @@ func TestThirdPartyInsideSameOwnerDependencyWithNoFix(t *testing.T) {
 	}
 	if strings.Contains(it.Fix, "in ext/tp/") {
 		t.Errorf("Fix = %q suggests editing a third-party file", it.Fix)
+	}
+}
+
+var shaV3 = strings.Repeat("3", 40)
+
+func sameOwnerApp(uses string) scan.Root {
+	return scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow(uses)}}
+}
+
+func TestSameOwnerDependencyIsUpgradedWhenReleaseIsPinned(t *testing.T) {
+	// From issue #3: v1 uses x/x unpinned, and the latest release fixed it.
+	f := fakeFetcher{
+		"me/shared/@" + shaV1: {"x/x@v1"},
+		"me/shared/@" + shaV2: {},
+		"x/x/@v1":             {},
+	}
+	refs := fakeRefs{"me/shared": {Tags: []Tag{{"v2.0.0", shaV2}}, Default: Tag{"main", shaV3}}}
+	it := only(t, plan(t, f, refs, sameOwnerApp("me/shared@"+shaV1+" # v1")))
+	want := "Upgrade to me/shared@" + shaV2 + " # v2.0.0 (major version change from v1)"
+	if it.FixKind != Upgrade || it.Fix != want {
+		t.Errorf("got %s: %q\nwant %q", it.FixKind, it.Fix, want)
+	}
+}
+
+func TestSameOwnerDependencyFixedOnlyOnDefaultBranchIsReleased(t *testing.T) {
+	f := fakeFetcher{
+		"me/shared/@" + shaV1: {"x/x@v1"},
+		"me/shared/@" + shaV2: {"x/x@v1"},
+		"me/shared/@" + shaV3: {},
+		"x/x/@v1":             {},
+	}
+	refs := fakeRefs{"me/shared": {Tags: []Tag{{"v2.0.0", shaV2}}, Default: Tag{"main", shaV3}}}
+	it := only(t, plan(t, f, refs, sameOwnerApp("me/shared@"+shaV1)))
+	want := "Release me/shared from main at 3333333, which is fully pinned (latest release v2.0.0 isn't), then upgrade to it"
+	if it.FixKind != PinUpstream || it.Fix != want {
+		t.Errorf("got %s: %q\nwant %q", it.FixKind, it.Fix, want)
+	}
+}
+
+func TestSameOwnerDependencyIsPinnedOnDefaultBranch(t *testing.T) {
+	// The default branch moved x/x down a line and added a third-party
+	// action, ext/tp, that has a clean release.
+	f := fakeFetcher{
+		"me/shared/@" + shaV1: {"x/x@v1"},
+		"me/shared/@" + shaV3: {"y/y@" + shaV1, "x/x@v1", "ext/tp@" + shaV1},
+		"y/y/@" + shaV1:       {},
+		"x/x/@v1":             {},
+		"ext/tp/@" + shaV1:    {"z/z@v1"},
+		"ext/tp/@" + shaV2:    {},
+		"z/z/@v1":             {},
+	}
+	refs := fakeRefs{
+		"me/shared": {Default: Tag{"main", shaV3}},
+		"ext/tp":    {Tags: []Tag{{"v2.0.0", shaV2}}},
+	}
+	it := only(t, plan(t, f, refs, sameOwnerApp("me/shared@"+shaV1)))
+	want := "Pin x/x@v1 in me/shared/action.yml:5 on main; " +
+		"Upgrade ext/tp@1111111 in me/shared/action.yml:6 on main to ext/tp@" + shaV2 + " # v2.0.0, then update this reference"
+	if it.FixKind != PinUpstream || it.Fix != want {
+		t.Errorf("got %s: %q\nwant %q", it.FixKind, it.Fix, want)
 	}
 }

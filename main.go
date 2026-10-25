@@ -164,7 +164,7 @@ func run(ctx context.Context, opts *options, args []string) error {
 	if err != nil {
 		return err
 	}
-	planner := &fix.Planner{Scanner: s, Tags: client}
+	planner := &fix.Planner{Scanner: s, Refs: client}
 	repos, err := planner.Plan(ctx, targets, res)
 	if err != nil {
 		return err
