@@ -11,7 +11,7 @@ gh extension install conspirates/gh-gha-scan
 
 Each release includes prebuilt binaries with signed build provenance. To check one, run `gh attestation verify <binary> -R conspirates/gh-gha-scan`.
 
-To build from source instead, you need Go 1.26.7 or later, which Go downloads automatically when the toolchain setting allows it.
+To build from source instead, you need Go 1.26.10 or later, which Go downloads automatically when the toolchain setting allows it.
 
 ```sh
 git clone https://github.com/conspirates/gh-gha-scan

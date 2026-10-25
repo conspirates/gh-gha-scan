@@ -1,6 +1,6 @@
 module github.com/conspirates/gh-gha-scan
 
-go 1.26.7
+go 1.26.10
 
 require (
 	github.com/cli/go-gh/v2 v2.17.0
