@@ -40,3 +40,18 @@ func TestTableTruncatesNothingInNarrowTerminal(t *testing.T) {
 		}
 	}
 }
+
+func TestIncompleteRepository(t *testing.T) {
+	repos := []fix.Repo{{Repository: "o/app", Items: []fix.Item{}, Incomplete: true}}
+	var table, summary bytes.Buffer
+	if err := Table(&table, repos, false, 80); err != nil {
+		t.Fatal(err)
+	}
+	if want := "o/app\tNone (incomplete, see warnings)\t\n"; table.String() != want {
+		t.Errorf("Table() = %q, want %q", table.String(), want)
+	}
+	Summary(&summary, repos, []string{"o/app: stopped at --depth 10; refs inside x were not checked"})
+	if !bytes.Contains(summary.Bytes(), []byte("1 repositories were not fully checked")) {
+		t.Errorf("Summary() = %q", summary.String())
+	}
+}

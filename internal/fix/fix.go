@@ -60,6 +60,9 @@ type Item struct {
 type Repo struct {
 	Repository string `json:"repository"`
 	Items      []Item `json:"items"`
+	// Incomplete means some references could not be read or were beyond
+	// the depth limit, so Items may be missing some; see the warnings.
+	Incomplete bool `json:"incomplete"`
 }
 
 // Planner computes fixes.
@@ -100,7 +103,7 @@ func (p *Planner) Plan(ctx context.Context, repos []scan.Root, res scan.Result) 
 
 	out := make([]Repo, 0, len(repos))
 	for _, root := range repos {
-		r := Repo{Repository: root.Name, Items: []Item{}}
+		r := Repo{Repository: root.Name, Items: []Item{}, Incomplete: res.Incomplete[root.Name]}
 		for _, g := range byRepo[root.Name] {
 			it := Item{
 				Action:   display(g.direct),

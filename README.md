@@ -52,8 +52,9 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 | Upgrade to `<action>@<sha> # <version>` | The dependency uses unpinned refs, and its newest release (by version tag) is fully pinned. Marked when the major version changes. |
 | Pin `<ref>` in `<file>`, then update this reference | The dependency belongs to the same owner, so the refs inside it can be pinned directly. |
 | No fix upstream yet | Even the newest release still uses unpinned refs: fork it, replace it, or ask upstream to pin. |
+| No verified fix | Part of the newest release couldn't be read, so it isn't known to be fully pinned. The warnings say what failed. |
 
-The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it.
+A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it.
 
 ## What counts
 

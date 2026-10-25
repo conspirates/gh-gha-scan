@@ -96,7 +96,8 @@ type Result struct {
 	Findings []Finding `json:"findings"`
 	Warnings []string  `json:"warnings"`
 	// Incomplete holds the names of roots with a reference that could not
-	// be read, so their findings may be missing some.
+	// be read or was not followed because of the depth limit, so their
+	// findings may be missing some.
 	Incomplete map[string]bool `json:"-"`
 }
 
@@ -143,11 +144,12 @@ type scanner struct {
 	nodes    map[string]*node
 	missing  map[string]bool
 	warnings []string
+	warned   map[string]bool
 }
 
 // Scan scans roots.
 func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
-	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}}
+	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}, warned: map[string]bool{}}
 
 	rootUses := make([][][]workflow.Use, len(roots))
 	var level []target
@@ -213,6 +215,15 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 
 func (sc *scanner) warn(format string, args ...any) {
 	sc.warnings = append(sc.warnings, fmt.Sprintf(format, args...))
+}
+
+// warnOnce is warn for messages that the walk can reach on many paths.
+func (sc *scanner) warnOnce(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if !sc.warned[msg] {
+		sc.warned[msg] = true
+		sc.warnings = append(sc.warnings, msg)
+	}
 }
 
 // targets resolves the references in uses that point at fetchable content.
@@ -355,7 +366,14 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 		}
 		return
 	}
-	if depth >= sc.Depth || onPath[t.key] {
+	if onPath[t.key] {
+		return
+	}
+	if depth >= sc.Depth {
+		if len(sc.targets(root, n.uses)) > 0 {
+			sc.warnOnce("%s: stopped at --depth %d; refs inside %s were not checked", root.Name, sc.Depth, n.loc(root))
+			res.Incomplete[root.Name] = true
+		}
 		return
 	}
 	onPath[t.key] = true

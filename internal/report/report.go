@@ -31,8 +31,12 @@ func Table(w io.Writer, repos []fix.Repo, isTTY bool, width int) error {
 	tp.AddHeader([]string{"REPOSITORY", "UNPINNED ACTION", "FIX"}, whole)
 	for _, r := range repos {
 		if len(r.Items) == 0 {
+			none := "None"
+			if r.Incomplete {
+				none = "None (incomplete, see warnings)"
+			}
 			tp.AddField(r.Repository, whole)
-			tp.AddField("None", whole)
+			tp.AddField(none, whole)
 			tp.AddField("")
 			tp.EndRow()
 			continue
@@ -49,14 +53,20 @@ func Table(w io.Writer, repos []fix.Repo, isTTY bool, width int) error {
 
 // Summary writes counts and warnings.
 func Summary(w io.Writer, repos []fix.Repo, warnings []string) {
-	affected, items := 0, 0
+	affected, items, incomplete := 0, 0, 0
 	for _, r := range repos {
 		if len(r.Items) > 0 {
 			affected++
 			items += len(r.Items)
 		}
+		if r.Incomplete {
+			incomplete++
+		}
 	}
 	fmt.Fprintf(w, "\nScanned %d repositories: %d affected, %d actions to change.\n", len(repos), affected, items)
+	if incomplete > 0 {
+		fmt.Fprintf(w, "%d repositories were not fully checked; see the warnings below.\n", incomplete)
+	}
 	if len(warnings) > 0 {
 		fmt.Fprintf(w, "\nWarnings (%d):\n", len(warnings))
 		for _, msg := range warnings {

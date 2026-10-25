@@ -142,6 +142,9 @@ func TestCycleTerminates(t *testing.T) {
 	if len(res.Findings) != 3 {
 		t.Errorf("got %+v", briefs(res.Findings))
 	}
+	if res.Incomplete["o/r"] || len(res.Warnings) != 0 {
+		t.Errorf("a cycle is not incomplete: Incomplete = %v, warnings = %v", res.Incomplete, res.Warnings)
+	}
 }
 
 func TestDepthLimit(t *testing.T) {
@@ -161,6 +164,22 @@ func TestDepthLimit(t *testing.T) {
 	}
 	if len(f.calls) != 2 {
 		t.Errorf("Fetch called %d times, want 2", len(f.calls))
+	}
+	// b/b uses c/c, which was cut off by the depth limit.
+	if !res.Incomplete["o/r"] || len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "stopped at --depth 2") {
+		t.Errorf("Incomplete = %v, warnings = %v; want one depth warning", res.Incomplete, res.Warnings)
+	}
+}
+
+func TestDepthLimitWithNothingBelowIsComplete(t *testing.T) {
+	f := &fakeFetcher{actions: map[string][]string{"a/a/@v1": {"b/b@v1"}, "b/b/@v1": {}}}
+	s := &Scanner{Fetcher: f, Depth: 2}
+	res, err := s.Scan(context.Background(), []Root{{Name: "o/r", Files: []File{workflowFile("a/a@v1")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Incomplete["o/r"] || len(res.Warnings) != 0 {
+		t.Errorf("Incomplete = %v, warnings = %v; want complete", res.Incomplete, res.Warnings)
 	}
 }
 
