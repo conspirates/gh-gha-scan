@@ -1,5 +1,7 @@
-// Package cache keeps files fetched at a full commit SHA on disk. Content at a
-// commit never changes, so these entries never expire.
+// Package cache keeps fetched files on disk. Content at a full commit SHA
+// never changes, so those entries never expire. Files at a tag or branch,
+// with the commit it points at, are kept for a short time, since tags and
+// branches can move.
 package cache
 
 import (
@@ -7,20 +9,33 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/conspirates/gh-gha-scan/internal/ref"
 	"github.com/conspirates/gh-gha-scan/internal/scan"
 )
 
-// Fetcher serves pinned requests from Dir and passes the rest to Inner.
+// Fetcher serves requests from Dir when it can and passes the rest to Inner.
 type Fetcher struct {
 	Inner scan.Fetcher
 	Dir   string
+	// TTL is how long an entry for a ref that is not a full commit SHA is
+	// used. Zero means such refs are never cached.
+	TTL time.Duration
 	// Hits counts requests served from disk.
 	Hits int
+
+	now func() time.Time
+}
+
+// entry is what a cache file holds.
+type entry struct {
+	Stored time.Time    `json:"stored"`
+	Res    scan.FileRes `json:"res"`
 }
 
 // DefaultDir returns the user cache directory for gh-gha-scan.
@@ -34,18 +49,46 @@ func DefaultDir() (string, error) {
 
 // version is part of every entry's name. Bump it when the meaning of a
 // request or the FileRes format changes, so old entries are never read.
-const version = "2"
+const version = "3"
 
 // path names the entry for req. The paths looked up are part of the name,
 // so a change in how candidates are chosen can't reuse an old answer.
 func (f *Fetcher) path(key string, req scan.FileReq) string {
-	id := version + "\x00" + key + "\x00" + strings.Join(req.Paths, "\x00")
+	id := fmt.Sprintf("%s\x00%s\x00%s\x00%v", version, key, strings.Join(req.Paths, "\x00"), req.Resolve)
 	sum := sha256.Sum256([]byte(id))
 	return filepath.Join(f.Dir, hex.EncodeToString(sum[:])+".json")
 }
 
-func cacheable(req scan.FileReq) bool {
+// pinned reports whether req's answer can never change.
+func pinned(req scan.FileReq) bool {
 	return ref.IsFullSHA(req.Ref) && !req.Resolve
+}
+
+func (f *Fetcher) cacheable(req scan.FileReq) bool {
+	return pinned(req) || f.TTL > 0
+}
+
+func (f *Fetcher) clock() time.Time {
+	if f.now != nil {
+		return f.now()
+	}
+	return time.Now()
+}
+
+// load returns the entry for req, unless it is missing or has expired.
+func (f *Fetcher) load(key string, req scan.FileReq) (scan.FileRes, bool) {
+	data, err := os.ReadFile(f.path(key, req))
+	if err != nil {
+		return scan.FileRes{}, false
+	}
+	var e entry
+	if json.Unmarshal(data, &e) != nil {
+		return scan.FileRes{}, false
+	}
+	if !pinned(req) && f.clock().Sub(e.Stored) >= f.TTL {
+		return scan.FileRes{}, false
+	}
+	return e.Res, true
 }
 
 // Fetch implements scan.Fetcher.
@@ -53,14 +96,11 @@ func (f *Fetcher) Fetch(ctx context.Context, reqs map[string]scan.FileReq) (map[
 	out := make(map[string]scan.FileRes, len(reqs))
 	rest := map[string]scan.FileReq{}
 	for k, req := range reqs {
-		if cacheable(req) {
-			if data, err := os.ReadFile(f.path(k, req)); err == nil {
-				var res scan.FileRes
-				if json.Unmarshal(data, &res) == nil {
-					out[k] = res
-					f.Hits++
-					continue
-				}
+		if f.cacheable(req) {
+			if res, ok := f.load(k, req); ok {
+				out[k] = res
+				f.Hits++
+				continue
 			}
 		}
 		rest[k] = req
@@ -74,16 +114,16 @@ func (f *Fetcher) Fetch(ctx context.Context, reqs map[string]scan.FileReq) (map[
 		out[k] = res
 		// Only found files are kept. An inaccessible repository or a missing
 		// file may be temporary, so those are asked again next time.
-		if cacheable(rest[k]) && res.Found && res.Err == "" {
-			f.store(f.path(k, rest[k]), res)
+		if f.cacheable(rest[k]) && res.Found && res.Err == "" {
+			f.store(f.path(k, rest[k]), entry{Stored: f.clock(), Res: res})
 		}
 	}
 	return out, err
 }
 
 // store writes an entry, ignoring failures: the cache is only an optimization.
-func (f *Fetcher) store(path string, res scan.FileRes) {
-	data, err := json.Marshal(res)
+func (f *Fetcher) store(path string, e entry) {
+	data, err := json.Marshal(e)
 	if err != nil {
 		return
 	}

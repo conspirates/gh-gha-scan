@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/conspirates/gh-gha-scan/internal/scan"
 )
@@ -24,7 +25,7 @@ func (c *countingFetcher) Fetch(_ context.Context, reqs map[string]scan.FileReq)
 	return out, nil
 }
 
-func TestCachesOnlyPinnedRefs(t *testing.T) {
+func TestWithoutTTLCachesOnlyPinnedRefs(t *testing.T) {
 	inner := &countingFetcher{calls: map[string]int{}}
 	f := &Fetcher{Inner: inner, Dir: t.TempDir()}
 	reqs := map[string]scan.FileReq{
@@ -79,5 +80,29 @@ func TestDifferentPathsDoNotShareEntries(t *testing.T) {
 	}
 	if inner.calls["k"] != 2 || got["k"].Path != "x" {
 		t.Errorf("calls = %d, path = %q; want a fresh fetch for different paths", inner.calls["k"], got["k"].Path)
+	}
+}
+
+func TestUnpinnedRefsAreCachedForTTL(t *testing.T) {
+	inner := &countingFetcher{calls: map[string]int{}}
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	f := &Fetcher{Inner: inner, Dir: t.TempDir(), TTL: time.Hour, now: func() time.Time { return now }}
+	reqs := map[string]scan.FileReq{"tag": {Owner: "o", Repo: "r", Ref: "v1", Paths: []string{"action.yml"}, Resolve: true}}
+	fetch := func() {
+		t.Helper()
+		if _, err := f.Fetch(context.Background(), reqs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fetch()
+	now = now.Add(59 * time.Minute)
+	fetch()
+	if inner.calls["tag"] != 1 {
+		t.Errorf("fetched %d times within the TTL, want 1", inner.calls["tag"])
+	}
+	now = now.Add(2 * time.Minute)
+	fetch()
+	if inner.calls["tag"] != 2 {
+		t.Errorf("fetched %d times after the TTL, want 2", inner.calls["tag"])
 	}
 }

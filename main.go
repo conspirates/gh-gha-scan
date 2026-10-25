@@ -76,7 +76,7 @@ unpinned references inside pinned third-party actions are reported too.`,
 	f.BoolVar(&opts.includeArchived, "include-archived", false, "include archived repositories with --owner")
 	f.BoolVar(&opts.includeForks, "include-forks", false, "include forks with --owner")
 	f.BoolVar(&opts.exitCode, "exit-code", false, "exit 1 when unpinned references are found, 2 when some could not be checked")
-	f.BoolVar(&opts.noCache, "no-cache", false, "do not use the on-disk cache for pinned references")
+	f.BoolVar(&opts.noCache, "no-cache", false, "do not use the on-disk cache")
 
 	if err := cmd.ExecuteContext(context.Background()); err != nil {
 		var status exitStatus
@@ -146,7 +146,7 @@ func run(ctx context.Context, opts *options, args []string) error {
 	var cached *cache.Fetcher
 	if !opts.noCache {
 		if dir, err := cache.DefaultDir(); err == nil {
-			cached = &cache.Fetcher{Inner: client, Dir: dir}
+			cached = &cache.Fetcher{Inner: client, Dir: dir, TTL: time.Hour}
 			fetcher = cached
 		}
 	}
