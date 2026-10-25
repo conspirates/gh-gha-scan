@@ -134,7 +134,6 @@ type node struct {
 	// file read from a local checkout, where path alone locates it.
 	repo, path, at string
 	uses           []workflow.Use
-	sha            string
 	// unparsed means the file could not be parsed, so uses may be missing.
 	unparsed bool
 }
@@ -163,13 +162,16 @@ type scanner struct {
 	nodes    map[string]*node
 	missing  map[string]bool
 	notFound map[string]bool
+	// resolved holds the commit of each fetched ref, even one whose file
+	// wasn't found.
+	resolved map[string]string
 	warnings []string
 	warned   map[string]bool
 }
 
 // Scan scans roots.
 func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
-	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}, notFound: map[string]bool{}, warned: map[string]bool{}}
+	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}, notFound: map[string]bool{}, resolved: map[string]string{}, warned: map[string]bool{}}
 	res := Result{Incomplete: map[string]bool{}}
 
 	rootUses := make([][][]workflow.Use, len(roots))
@@ -330,6 +332,9 @@ func (sc *scanner) load(ctx context.Context, ts []target) error {
 	sort.Strings(keys)
 	for _, k := range keys {
 		req, res := reqs[k], got[k]
+		if res.SHA != "" {
+			sc.resolved[k] = res.SHA
+		}
 		name := req.Owner + "/" + req.Repo + "@" + req.Ref
 		switch {
 		case res.Err != "":
@@ -340,7 +345,7 @@ func (sc *scanner) load(ctx context.Context, ts []target) error {
 			sc.missing[k] = true
 			sc.notFound[k] = true
 		default:
-			sc.addNode(k, &node{repo: req.Owner + "/" + req.Repo, path: res.Path, at: req.Ref, sha: res.SHA}, []byte(res.Text))
+			sc.addNode(k, &node{repo: req.Owner + "/" + req.Repo, path: res.Path, at: req.Ref}, []byte(res.Text))
 		}
 	}
 	return nil
@@ -436,9 +441,7 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start workflow.Use
 					f.SourceOwner, _, _ = strings.Cut(in.repo, "/")
 				}
 			}
-			if n := sc.nodes[t.key]; n != nil {
-				f.SuggestedSHA = n.sha
-			}
+			f.SuggestedSHA = sc.resolved[t.key]
 			res.Findings = append(res.Findings, f)
 		}
 		n := sc.nodes[t.key]

@@ -538,7 +538,7 @@ func describe(it *Item, root scan.Root, g *group, st *state) {
 
 	case c != nil && c.removed:
 		it.FixKind = None
-		it.Fix, it.Reason = noFix(g.ref, c, nested[0].Uses)
+		it.Fix, it.Reason = st.noFix(g.ref, c, nested[0].Uses)
 		note(onBranch)
 
 	case sameOwner(root.Owner, g.ref):
@@ -547,7 +547,7 @@ func describe(it *Item, root scan.Root, g *group, st *state) {
 
 	default:
 		it.FixKind = None
-		it.Fix, it.Reason = noFix(g.ref, c, nested[0].Uses)
+		it.Fix, it.Reason = st.noFix(g.ref, c, nested[0].Uses)
 		note(onBranch)
 	}
 }
@@ -593,7 +593,7 @@ func describeUpstream(it *Item, g *group, st *state) {
 			if c := st.release(b); c != nil && c.clean {
 				s = fmt.Sprintf("Upgrade %s to %s@%s # %s", at, b.Name(), c.tag.SHA, c.tag.Name)
 			} else {
-				why, reason := noFix(b, c, f.Uses)
+				why, reason := st.noFix(b, c, f.Uses)
 				if it.FixKind != None {
 					it.FixKind, it.Reason = None, reason
 				}
@@ -613,12 +613,14 @@ func describeUpstream(it *Item, g *group, st *state) {
 
 // noFix explains why r has no fix: c is its newest release, or nil when it
 // has none, and uses is an unpinned reference inside it.
-func noFix(r ref.Ref, c *candidate, uses string) (string, Reason) {
+func (st *state) noFix(r ref.Ref, c *candidate, uses string) (string, Reason) {
 	switch {
 	case c != nil && c.removed:
 		return fmt.Sprintf("%s no longer exists in %s; migrate to its replacement", r.Name(), c.tag.Name), Removed
 	case c != nil && c.blocker == "" && c.unverified:
 		return fmt.Sprintf("No verified fix: could not read all of latest release %s to check it (see warnings)", c.tag.Name), Unverified
+	case c == nil && len(st.refs[repoKey(r)].Tags) > 0:
+		return fmt.Sprintf("No fix upstream yet: %s has no version tags (like v1.2.3) to upgrade to, and uses %s unpinned; fork it or ask upstream to pin", r.Name(), uses), NoUpstreamFix
 	case c == nil:
 		return fmt.Sprintf("No fix upstream yet: %s has no releases and uses %s unpinned; fork it or ask upstream to pin", r.Name(), uses), NoUpstreamFix
 	}

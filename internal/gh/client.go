@@ -264,7 +264,8 @@ func (c *Client) workflowsBatch(ctx context.Context, nodes []repoNode) ([]Repo, 
 		var resp map[string]*struct {
 			Object json.RawMessage `json:"object"`
 		}
-		errs, err := aliasErrors(c.do(ctx, workflowsQuery(nodes), nil, &resp))
+		q, vars := workflowsQuery(nodes)
+		errs, err := aliasErrors(c.do(ctx, q, vars, &resp))
 		if err != nil {
 			return nil, err
 		}
@@ -413,7 +414,8 @@ func (c *Client) Refs(ctx context.Context, repos map[string][]string) (map[strin
 	}
 	run := func(chunk []string) ([]result, error) {
 		var resp map[string]map[string]json.RawMessage
-		if _, err := aliasErrors(c.do(ctx, tagsQuery(chunk, repos), nil, &resp)); err != nil {
+		q, vars := tagsQuery(chunk, repos)
+		if _, err := aliasErrors(c.do(ctx, q, vars, &resp)); err != nil {
 			return nil, err
 		}
 		var out []result
@@ -520,7 +522,8 @@ func (c *Client) fetchBatch(ctx context.Context, keys []string, all map[string]s
 			reqs[i] = all[k]
 		}
 		var resp map[string]json.RawMessage
-		errs, err := aliasErrors(c.do(ctx, batchQuery(reqs), nil, &resp))
+		q, vars := batchQuery(reqs)
+		errs, err := aliasErrors(c.do(ctx, q, vars, &resp))
 		if err != nil {
 			return nil, err
 		}
@@ -528,33 +531,34 @@ func (c *Client) fetchBatch(ctx context.Context, keys []string, all map[string]s
 		for i, k := range keys {
 			req, alias := reqs[i], fmt.Sprintf("r%d", i)
 			out[i].key = k
-			var objs map[string]json.RawMessage
+			var repo map[string]json.RawMessage
 			if raw := resp[alias]; len(raw) > 0 {
-				_ = json.Unmarshal(raw, &objs)
+				_ = json.Unmarshal(raw, &repo)
 			}
-			if objs == nil {
+			if repo == nil {
 				out[i].res = scan.FileRes{Err: errs[alias].message(req.Owner)}
 				continue
 			}
+			// The commit is null when the ref doesn't exist.
+			var commit map[string]json.RawMessage
+			_ = json.Unmarshal(repo["object"], &commit)
 			var res scan.FileRes
+			_ = json.Unmarshal(commit["oid"], &res.SHA)
 			for j, p := range req.Paths {
-				var b *blob
-				_ = json.Unmarshal(objs[fmt.Sprintf("f%d", j)], &b)
-				if b == nil || b.IsBinary {
+				var entry *struct {
+					Object *blob `json:"object"`
+				}
+				_ = json.Unmarshal(commit[fmt.Sprintf("f%d", j)], &entry)
+				if entry == nil || entry.Object == nil || entry.Object.IsBinary {
 					continue
 				}
-				text, err := c.text(ctx, req.Owner+"/"+req.Repo, req.Ref, p, b)
+				text, err := c.text(ctx, req.Owner+"/"+req.Repo, res.SHA, p, entry.Object)
 				if err != nil {
-					res = scan.FileRes{Err: err.Error()}
+					res.Err = err.Error()
 					break
 				}
-				res = scan.FileRes{Found: true, Path: p, Text: text}
+				res.Found, res.Path, res.Text = true, p, text
 				break
-			}
-			if req.Resolve {
-				var o *object
-				_ = json.Unmarshal(objs["c"], &o)
-				res.SHA = o.commit()
 			}
 			out[i].res = res
 		}

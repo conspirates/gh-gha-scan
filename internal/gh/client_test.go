@@ -98,12 +98,10 @@ func TestOwnerReposFetchesOnlyUncachedCommits(t *testing.T) {
 		"errors":[{"type":"NOT_FOUND","path":["r1"],"message":"Could not resolve to a Repository"}]}`
 	var queries []string
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Query string }
-		b, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(b, &body)
-		queries = append(queries, body.Query)
+		q := graphQLQuery(r)
+		queries = append(queries, q)
 		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(body.Query, "repositoryOwner") {
+		if strings.Contains(q, "repositoryOwner") {
 			w.Write([]byte(listing))
 		} else {
 			w.Write([]byte(workflows))
@@ -166,12 +164,17 @@ func TestRefsTellsBranchesFromTags(t *testing.T) {
 	}
 }
 
-// graphQLQuery returns the query of a GraphQL request.
+// graphQLQuery returns the query of a GraphQL request, followed by its
+// variables' values.
 func graphQLQuery(r *http.Request) string {
-	var body struct{ Query string }
+	var body struct {
+		Query     string
+		Variables map[string]any
+	}
 	b, _ := io.ReadAll(r.Body)
 	_ = json.Unmarshal(b, &body)
-	return body.Query
+	vals, _ := json.Marshal(body.Variables)
+	return body.Query + "\n" + string(vals)
 }
 
 func reply(w http.ResponseWriter, body string) {
@@ -187,7 +190,7 @@ func fileReq(repo string) scan.FileReq {
 func TestFetchFailsOnlyTheRefThatCantBeRead(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		reply(w, `{"data":{"rateLimit":{"cost":1,"remaining":4999},
-			"r0":{"f0":{"text":"runs: {using: node20}","isTruncated":false,"isBinary":false}},
+			"r0":{"object":{"oid":"sha-a","f0":{"object":{"text":"runs: {using: node20}","isTruncated":false,"isBinary":false}}}},
 			"r1":null,"r2":null},
 			"errors":[
 				{"type":"FORBIDDEN","path":["r1"],"message":"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization."},
@@ -221,7 +224,7 @@ func TestFetchSplitsABatchRejectedWhole(t *testing.T) {
 			reply(w, `{"errors":[{"type":"MAX_NODE_LIMIT_EXCEEDED","message":"too big"}]}`)
 			return
 		}
-		reply(w, `{"data":{"rateLimit":{"cost":1,"remaining":4999},"r0":{"f0":{"text":"runs: {}","isTruncated":false,"isBinary":false}}}}`)
+		reply(w, `{"data":{"rateLimit":{"cost":1,"remaining":4999},"r0":{"object":{"oid":"sha-ok","f0":{"object":{"text":"runs: {}","isTruncated":false,"isBinary":false}}}}}}`)
 	})
 	got, err := c.Fetch(context.Background(), map[string]scan.FileReq{"big": fileReq("a/big"), "ok": fileReq("b/ok")})
 	if err != nil {
@@ -293,5 +296,23 @@ func TestOwnerReposKeepsReposThatCantBeRead(t *testing.T) {
 	}
 	if locked.Err != "Resource not accessible by integration" {
 		t.Errorf("o/locked = %+v, want its error", locked)
+	}
+}
+
+func TestFetchReturnsTheCommitWithoutTheFile(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		reply(w, `{"data":{"rateLimit":{"cost":1,"remaining":4999},
+			"r0":{"object":{"oid":"abc123","f0":null}},
+			"r1":{"object":null}}}`)
+	})
+	got, err := c.Fetch(context.Background(), map[string]scan.FileReq{"a": fileReq("a/moved"), "b": fileReq("b/noref")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := got["a"]; a.Found || a.SHA != "abc123" || a.Err != "" {
+		t.Errorf("a = %+v, want not found with its commit", a)
+	}
+	if b := got["b"]; b.Found || b.SHA != "" || b.Err != "" {
+		t.Errorf("b = %+v, want not found without a commit (the ref doesn't exist)", b)
 	}
 }

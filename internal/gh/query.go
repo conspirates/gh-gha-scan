@@ -3,7 +3,6 @@
 package gh
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -49,17 +48,16 @@ const WorkflowsPerQuery = 25
 
 // workflowsQuery reads the top-level workflow files of each repository at a
 // commit, aliased rN.
-func workflowsQuery(repos []repoNode) string {
+func workflowsQuery(repos []repoNode) (string, map[string]any) {
+	var v vars
 	var b strings.Builder
-	b.WriteString("query {\n  " + rateLimitField + "\n")
 	for i, r := range repos {
 		owner, name, _ := strings.Cut(r.NameWithOwner, "/")
-		fmt.Fprintf(&b, "  r%d: repository(owner: %s, name: %s) {\n", i, quote(owner), quote(name))
-		fmt.Fprintf(&b, "    object(expression: %s) { %s }\n", quote(r.oid()+":.github/workflows"), workflowsTree)
+		fmt.Fprintf(&b, "  r%d: repository(owner: %s, name: %s) {\n", i, v.add(fmt.Sprintf("o%d", i), owner), v.add(fmt.Sprintf("n%d", i), name))
+		fmt.Fprintf(&b, "    object(expression: %s) { %s }\n", v.add(fmt.Sprintf("e%d", i), r.oid()+":.github/workflows"), workflowsTree)
 		b.WriteString("  }\n")
 	}
-	b.WriteString("}\n")
-	return b.String()
+	return v.query(b.String()), v.vals
 }
 
 const repoQuery = `query($owner: String!, $name: String!) {
@@ -68,30 +66,49 @@ const repoQuery = `query($owner: String!, $name: String!) {
 }
 ` + repoFields
 
-// quote returns s as a GraphQL string literal. JSON string syntax is a
-// subset of GraphQL's.
-func quote(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
+// vars collects the String! variables of a query built in pieces, so that
+// values never have to be quoted into the query text.
+type vars struct {
+	decl []string
+	vals map[string]any
+}
+
+// add declares variable name with value val and returns its reference.
+func (v *vars) add(name, val string) string {
+	if v.vals == nil {
+		v.vals = map[string]any{}
+	}
+	v.decl = append(v.decl, "$"+name+": String!")
+	v.vals[name] = val
+	return "$" + name
+}
+
+// query wraps body, the selections of the query, in a query that declares
+// the variables.
+func (v *vars) query(body string) string {
+	head := "query"
+	if len(v.decl) > 0 {
+		head += "(" + strings.Join(v.decl, ", ") + ")"
+	}
+	return head + " {\n  " + rateLimitField + "\n" + body + "}\n"
 }
 
 // batchQuery builds one query for reqs, which must be in a stable order. Each
-// request becomes alias rN, each candidate path fM, and the resolved commit c.
-func batchQuery(reqs []scan.FileReq) string {
+// request becomes alias rN. Its ref is looked up as a commit, which also peels
+// annotated tags, and each candidate path is read from that commit as fM, so
+// the commit comes back even when no file is found.
+func batchQuery(reqs []scan.FileReq) (string, map[string]any) {
+	var v vars
 	var b strings.Builder
-	b.WriteString("query {\n  " + rateLimitField + "\n")
 	for i, req := range reqs {
-		fmt.Fprintf(&b, "  r%d: repository(owner: %s, name: %s) {\n", i, quote(req.Owner), quote(req.Repo))
+		fmt.Fprintf(&b, "  r%d: repository(owner: %s, name: %s) {\n", i, v.add(fmt.Sprintf("o%d", i), req.Owner), v.add(fmt.Sprintf("n%d", i), req.Repo))
+		fmt.Fprintf(&b, "    object(expression: %s) { ... on Commit { oid", v.add(fmt.Sprintf("e%d", i), req.Ref+"^{commit}"))
 		for j, p := range req.Paths {
-			fmt.Fprintf(&b, "    f%d: object(expression: %s) { %s }\n", j, quote(req.Ref+":"+p), blobFields)
+			fmt.Fprintf(&b, " f%d: file(path: %s) { object { %s } }", j, v.add(fmt.Sprintf("p%d_%d", i, j), p), blobFields)
 		}
-		if req.Resolve {
-			fmt.Fprintf(&b, "    c: object(expression: %s) { oid ... on Tag { target { oid ... on Tag { target { oid } } } } }\n", quote(req.Ref))
-		}
-		b.WriteString("  }\n")
+		b.WriteString(" } }\n  }\n")
 	}
-	b.WriteString("}\n")
-	return b.String()
+	return v.query(b.String()), v.vals
 }
 
 // TagsPerRepo is how many of the most recent tags are listed per repository
@@ -101,24 +118,23 @@ const TagsPerRepo = 50
 // tagsQuery lists the default branch and recent tags of repos (owner/repo),
 // aliased tN. For each name in branches[repo] it also asks for the branch,
 // aliased bM, and for a tag of the same name, aliased xM.
-func tagsQuery(repos []string, branches map[string][]string) string {
+func tagsQuery(repos []string, branches map[string][]string) (string, map[string]any) {
+	var v vars
 	var b strings.Builder
-	b.WriteString("query {\n  " + rateLimitField + "\n")
 	for i, r := range repos {
 		owner, name, _ := strings.Cut(r, "/")
-		fmt.Fprintf(&b, "  t%d: repository(owner: %s, name: %s) {\n", i, quote(owner), quote(name))
+		fmt.Fprintf(&b, "  t%d: repository(owner: %s, name: %s) {\n", i, v.add(fmt.Sprintf("o%d", i), owner), v.add(fmt.Sprintf("n%d", i), name))
 		b.WriteString("    defaultBranchRef { name target { oid } }\n")
 		fmt.Fprintf(&b, "    refs(refPrefix: \"refs/tags/\", first: %d, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {\n", TagsPerRepo)
 		b.WriteString("      nodes { name target { oid ... on Tag { target { oid ... on Tag { target { oid } } } } } }\n")
 		b.WriteString("    }\n")
 		for j, name := range branches[r] {
-			fmt.Fprintf(&b, "    b%d: ref(qualifiedName: %s) { target { oid } }\n", j, quote("refs/heads/"+name))
-			fmt.Fprintf(&b, "    x%d: ref(qualifiedName: %s) { name }\n", j, quote("refs/tags/"+name))
+			fmt.Fprintf(&b, "    b%d: ref(qualifiedName: %s) { target { oid } }\n", j, v.add(fmt.Sprintf("b%d_%d", i, j), "refs/heads/"+name))
+			fmt.Fprintf(&b, "    x%d: ref(qualifiedName: %s) { name }\n", j, v.add(fmt.Sprintf("x%d_%d", i, j), "refs/tags/"+name))
 		}
 		b.WriteString("  }\n")
 	}
-	b.WriteString("}\n")
-	return b.String()
+	return v.query(b.String()), v.vals
 }
 
 type tagNode struct {

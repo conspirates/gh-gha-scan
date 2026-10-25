@@ -2,6 +2,7 @@ package gh
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -9,31 +10,40 @@ import (
 )
 
 func TestBatchQuery(t *testing.T) {
-	q := batchQuery([]scan.FileReq{
+	q, vars := batchQuery([]scan.FileReq{
 		{Owner: "actions", Repo: "checkout", Ref: "v4", Paths: []string{"action.yml", "action.yaml"}, Resolve: true},
 		{Owner: "o", Repo: "r", Ref: "main", Paths: []string{".github/workflows/x.yml"}},
 	})
 	for _, want := range []string{
-		`r0: repository(owner: "actions", name: "checkout")`,
-		`f0: object(expression: "v4:action.yml")`,
-		`f1: object(expression: "v4:action.yaml")`,
-		`c: object(expression: "v4")`,
-		`r1: repository(owner: "o", name: "r")`,
-		`f0: object(expression: "main:.github/workflows/x.yml")`,
+		`query($o0: String!, $n0: String!, $e0: String!, $p0_0: String!, $p0_1: String!, $o1: String!`,
+		`r0: repository(owner: $o0, name: $n0)`,
+		`object(expression: $e0) { ... on Commit { oid f0: file(path: $p0_0)`,
+		`f1: file(path: $p0_1)`,
+		`r1: repository(owner: $o1, name: $n1)`,
 		`rateLimit { cost remaining resetAt }`,
 	} {
 		if !strings.Contains(q, want) {
 			t.Errorf("query missing %q:\n%s", want, q)
 		}
 	}
-	if strings.Count(q, "c: object") != 1 {
-		t.Errorf("only requests with Resolve should resolve a commit:\n%s", q)
+	want := map[string]any{
+		"o0": "actions", "n0": "checkout", "e0": "v4^{commit}", "p0_0": "action.yml", "p0_1": "action.yaml",
+		"o1": "o", "n1": "r", "e1": "main^{commit}", "p1_0": ".github/workflows/x.yml",
+	}
+	if !reflect.DeepEqual(vars, want) {
+		t.Errorf("vars = %v, want %v", vars, want)
 	}
 }
 
-func TestQuoteEscapes(t *testing.T) {
-	if got := quote(`a"b\c`); got != `"a\"b\\c"` {
-		t.Errorf("quote = %s", got)
+func TestValuesAreNeverInTheQueryText(t *testing.T) {
+	odd := `a"b\c} { x`
+	q, _ := batchQuery([]scan.FileReq{{Owner: odd, Repo: odd, Ref: odd, Paths: []string{odd}}})
+	q2, _ := tagsQuery([]string{odd + "/" + odd}, map[string][]string{odd + "/" + odd: {odd}})
+	q3, _ := workflowsQuery([]repoNode{{NameWithOwner: odd + "/" + odd}})
+	for _, q := range []string{q, q2, q3} {
+		if strings.Contains(q, "b\\c") || strings.Contains(q, `a"b`) {
+			t.Errorf("a value is in the query text:\n%s", q)
+		}
 	}
 }
 
@@ -56,17 +66,20 @@ func TestCommitPeelsTags(t *testing.T) {
 }
 
 func TestTagsQuery(t *testing.T) {
-	q := tagsQuery([]string{"actions/checkout", "o/r"}, map[string][]string{"o/r": {"main"}})
+	q, vars := tagsQuery([]string{"actions/checkout", "o/r"}, map[string][]string{"o/r": {"main"}})
 	for _, want := range []string{
-		`t0: repository(owner: "actions", name: "checkout")`,
-		`t1: repository(owner: "o", name: "r")`,
+		`t1: repository(owner: $o1, name: $n1)`,
 		`defaultBranchRef { name target { oid } }`,
-		`b0: ref(qualifiedName: "refs/heads/main") { target { oid } }`,
-		`x0: ref(qualifiedName: "refs/tags/main") { name }`,
+		`t0: repository(owner: $o0, name: $n0)`,
+		`b0: ref(qualifiedName: $b1_0) { target { oid } }`,
+		`x0: ref(qualifiedName: $x1_0) { name }`,
 		`refs(refPrefix: "refs/tags/", first: 50, orderBy: {field: TAG_COMMIT_DATE, direction: DESC})`,
 	} {
 		if !strings.Contains(q, want) {
 			t.Errorf("query missing %q:\n%s", want, q)
 		}
+	}
+	if vars["b1_0"] != "refs/heads/main" || vars["x1_0"] != "refs/tags/main" || vars["o0"] != "actions" {
+		t.Errorf("vars = %v", vars)
 	}
 }

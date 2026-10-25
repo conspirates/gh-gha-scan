@@ -445,3 +445,43 @@ func TestBranchName(t *testing.T) {
 		}
 	}
 }
+
+func TestTagsThatAreNotVersions(t *testing.T) {
+	f := fakeFetcher{"up/action/@v1": {"actions/setup-go@v5"}}
+	tags := fakeTags{"up/action": {{"latest", shaV2}, {"release-2026", shaV2}}}
+	it := only(t, plan(t, f, tags, scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("up/action@v1")}}))
+	want := "No fix upstream yet: up/action has no version tags (like v1.2.3) to upgrade to, and uses actions/setup-go@v5 unpinned"
+	if it.FixKind != None || !strings.HasPrefix(it.Fix, want) {
+		t.Errorf("got %s: %q\nwant prefix %q", it.FixKind, it.Fix, want)
+	}
+}
+
+func TestPinWhenOnlyTheFileIsMissing(t *testing.T) {
+	// The ref resolved, but its action.yml wasn't found: pin to the commit
+	// rather than claim it couldn't be resolved.
+	s := &scan.Scanner{Fetcher: shaOnlyFetcher{}, Depth: 10, Resolve: true}
+	root := scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("up/action@main")}}
+	res, err := s.Scan(context.Background(), []scan.Root{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repos, err := (&Planner{Scanner: s, Refs: fakeTags{}}).Plan(context.Background(), []scan.Root{root}, res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := only(t, repos)
+	if want := "Pin to up/action@" + shaV3 + " # main"; it.Fix != want {
+		t.Errorf("Fix = %q, want %q", it.Fix, want)
+	}
+}
+
+// shaOnlyFetcher resolves every ref to shaV3 but finds no files.
+type shaOnlyFetcher struct{}
+
+func (shaOnlyFetcher) Fetch(_ context.Context, reqs map[string]scan.FileReq) (map[string]scan.FileRes, error) {
+	out := map[string]scan.FileRes{}
+	for k := range reqs {
+		out[k] = scan.FileRes{SHA: shaV3}
+	}
+	return out, nil
+}
