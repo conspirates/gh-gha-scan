@@ -32,7 +32,7 @@ gh gha-scan --owner my-org --json | jq '.repositories[] | select(.items != [])'
 | Flag | |
 |---|---|
 | `--json` | Output every repository with its items, fixes and the underlying findings, plus warnings and API stats, as JSON |
-| `--exit-code` | Exit 1 when unpinned refs are found (for CI) |
+| `--exit-code` | Set the exit status from the result, for CI (see [Exit status](#exit-status)) |
 | `--depth N` | Follow transitive refs at most N levels deep (default 10) |
 | `--include-archived`, `--include-forks` | Include archived repositories or forks with `--owner` (excluded by default) |
 | `--no-cache` | Don't use the on-disk cache |
@@ -59,6 +59,17 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 | No verified fix | Part of the newest release couldn't be read, so it isn't known to be fully pinned. The warnings say what failed. |
 
 A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read, couldn't be parsed or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it.
+
+## Exit status
+
+| Status | Meaning |
+|---|---|
+| 0 | Success. With `--exit-code`: everything was checked and nothing is unpinned. |
+| 1 | With `--exit-code`: unpinned refs were found, whether or not the scan is also incomplete. |
+| 2 | With `--exit-code`: nothing unpinned was found, but some repositories are incomplete (see the warnings), so the result isn't known to be clean. |
+| 3 | The scan failed, e.g. invalid arguments or an API error. |
+
+Without `--exit-code`, a scan that runs exits 0 whatever it finds.
 
 ## What counts
 

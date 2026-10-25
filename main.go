@@ -34,8 +34,17 @@ type options struct {
 	noCache         bool
 }
 
-// errFindings makes the command exit 1 without printing an error.
-var errFindings = errors.New("unpinned references found")
+// Exit statuses. Without --exit-code, a scan exits 0 whatever it finds.
+const (
+	exitUnpinned   = 1 // unpinned references found
+	exitIncomplete = 2 // none found, but not everything could be checked
+	exitError      = 3 // the scan failed
+)
+
+// exitStatus makes the command exit with a status without printing an error.
+type exitStatus int
+
+func (e exitStatus) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
 
 func main() {
 	opts := &options{}
@@ -64,14 +73,16 @@ unpinned references inside pinned third-party actions are reported too.`,
 	f.IntVar(&opts.depth, "depth", 10, "maximum depth of transitive references to follow")
 	f.BoolVar(&opts.includeArchived, "include-archived", false, "include archived repositories with --owner")
 	f.BoolVar(&opts.includeForks, "include-forks", false, "include forks with --owner")
-	f.BoolVar(&opts.exitCode, "exit-code", false, "exit with status 1 when unpinned references are found")
+	f.BoolVar(&opts.exitCode, "exit-code", false, "exit 1 when unpinned references are found, 2 when some could not be checked")
 	f.BoolVar(&opts.noCache, "no-cache", false, "do not use the on-disk cache for pinned references")
 
 	if err := cmd.ExecuteContext(context.Background()); err != nil {
-		if !errors.Is(err, errFindings) {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		var status exitStatus
+		if errors.As(err, &status) {
+			os.Exit(int(status))
 		}
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(exitError)
 	}
 }
 
@@ -169,8 +180,24 @@ func run(ctx context.Context, opts *options, args []string) error {
 		fmt.Fprintln(t.ErrOut(), msg)
 	}
 
-	if opts.exitCode && len(res.Findings) > 0 {
-		return errFindings
+	if opts.exitCode {
+		return status(repos)
+	}
+	return nil
+}
+
+// status is the --exit-code result: unpinned references take precedence
+// over incomplete repositories, since both fail but the first is certain.
+func status(repos []fix.Repo) error {
+	incomplete := false
+	for _, r := range repos {
+		if len(r.Items) > 0 {
+			return exitStatus(exitUnpinned)
+		}
+		incomplete = incomplete || r.Incomplete
+	}
+	if incomplete {
+		return exitStatus(exitIncomplete)
 	}
 	return nil
 }
