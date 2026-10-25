@@ -5,7 +5,13 @@ Scans for insecure use of GitHub Actions.
 
 ## Install
 
-There's no release with prebuilt binaries yet, so build it from source. This needs Go 1.26.7 or later, which Go downloads automatically when the toolchain setting allows it.
+```sh
+gh extension install conspirates/gh-gha-scan
+```
+
+Each release includes prebuilt binaries with signed build provenance. To check one, run `gh attestation verify <binary> -R conspirates/gh-gha-scan`.
+
+To build from source instead, you need Go 1.26.7 or later, which Go downloads automatically when the toolchain setting allows it.
 
 ```sh
 git clone https://github.com/conspirates/gh-gha-scan
@@ -13,8 +19,6 @@ cd gh-gha-scan
 go build -o gh-gha-scan .
 gh extension install .
 ```
-
-Once a release exists, `gh extension install conspirates/gh-gha-scan` will work too.
 
 ## Usage
 
