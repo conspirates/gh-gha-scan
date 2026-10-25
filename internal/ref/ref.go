@@ -14,6 +14,9 @@ const (
 	Invalid Kind = iota
 	// Local is a path in the same repository, e.g. ./.github/actions/foo.
 	Local
+	// Self is a path in the repository of the file it is written in, at the
+	// running commit, e.g. $/.github/actions/foo.
+	Self
 	// Docker is a container image, e.g. docker://alpine:3.
 	Docker
 	// Action is a repository action, e.g. actions/checkout@v4.
@@ -26,6 +29,8 @@ func (k Kind) String() string {
 	switch k {
 	case Local:
 		return "local"
+	case Self:
+		return "self"
 	case Docker:
 		return "docker"
 	case Action:
@@ -62,6 +67,14 @@ func Parse(s string) Ref {
 	case strings.HasPrefix(s, "./"):
 		r.Kind = Local
 		r.Path = strings.Trim(strings.TrimPrefix(s, "./"), "/")
+		return r
+	case strings.HasPrefix(s, "$/"):
+		// The commit is always the running one, so a ref is not allowed.
+		if strings.Contains(s, "@") {
+			return r
+		}
+		r.Kind = Self
+		r.Path = strings.Trim(strings.TrimPrefix(s, "$/"), "/")
 		return r
 	case strings.HasPrefix(s, "docker://"):
 		r.Kind = Docker
@@ -117,10 +130,10 @@ func (r Ref) Key() string {
 }
 
 // Candidates returns the file paths that may hold r's definition, in the
-// order GitHub looks them up. A local ref to a workflow file is a reusable
-// workflow in the same repository, so it is the file itself.
+// order GitHub looks them up. A local or self ref to a workflow file is a
+// reusable workflow in the same repository, so it is the file itself.
 func (r Ref) Candidates() []string {
-	if r.Kind == Workflow || (r.Kind == Local && IsWorkflowPath(r.Path)) {
+	if r.Kind == Workflow || ((r.Kind == Local || r.Kind == Self) && IsWorkflowPath(r.Path)) {
 		return []string{r.Path}
 	}
 	dir := r.Path

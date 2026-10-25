@@ -370,3 +370,90 @@ func TestRemoteRootShowsLocalActionPathInRepo(t *testing.T) {
 		t.Errorf("Direct.File = %q, Source = %q; want paths in the repository", f0.Direct.File, f0.Source)
 	}
 }
+
+func TestSelfRefInLocalRoot(t *testing.T) {
+	// From the fixture in issue #2.
+	read := func(p string) ([]byte, error) {
+		if p == ".github/actions/local/action.yml" {
+			return []byte(composite("actions/cache@v4")), nil
+		}
+		return nil, errors.New("not found")
+	}
+	f := &fakeFetcher{actions: map[string][]string{"actions/cache/@v4": {}}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{
+		Name: "example/fixture", ReadLocal: read,
+		Files: []File{workflowFile("$/.github/actions/local")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []brief{{"actions/cache@v4", []string{"$/.github/actions/local"}}}
+	if got := briefs(res.Findings); !reflect.DeepEqual(got, want) {
+		t.Errorf("findings = %+v, want %+v", got, want)
+	}
+	if len(res.Warnings) != 0 || res.Incomplete["example/fixture"] {
+		t.Errorf("warnings = %v, incomplete = %v; want none", res.Warnings, res.Incomplete)
+	}
+}
+
+func TestSelfRefInRemoteRootResolvesAtHead(t *testing.T) {
+	f := &fakeFetcher{actions: map[string][]string{
+		"me/repo/.github/actions/x@" + pinned: {"ext/a@v1"},
+		"ext/a/@v1":                           {},
+	}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{
+		Name: "me/repo", Repo: "me/repo", HeadOID: pinned,
+		Files: []File{workflowFile("$/.github/actions/x")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []brief{{"ext/a@v1", []string{"$/.github/actions/x"}}}
+	if got := briefs(res.Findings); !reflect.DeepEqual(got, want) {
+		t.Errorf("findings = %+v, want %+v", got, want)
+	}
+}
+
+func TestSelfRefBelowRemoteResolvesInThatRepo(t *testing.T) {
+	// A $/ ref in ext/lib resolves in ext/lib at the same ref, not in the
+	// scanned repository, even though the root could read ./ refs locally.
+	f := &fakeFetcher{actions: map[string][]string{
+		"ext/lib/@" + pinned:                      {"$/.github/actions/inner"},
+		"ext/lib/.github/actions/inner@" + pinned: {"ext/deep@v1"},
+		"ext/deep/@v1":                            {},
+	}}
+	read := func(string) ([]byte, error) { return nil, errors.New("not found") }
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{
+		Name: "me/app", ReadLocal: read,
+		Files: []File{workflowFile("ext/lib@" + pinned)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []brief{{"ext/deep@v1", []string{"ext/lib@1111111", "$/.github/actions/inner"}}}
+	if got := briefs(res.Findings); !reflect.DeepEqual(got, want) {
+		t.Errorf("findings = %+v, want %+v", got, want)
+	}
+	if got := res.Findings[0].Source; got != "ext/lib/.github/actions/inner/action.yml@"+pinned+":4" {
+		t.Errorf("Source = %q", got)
+	}
+	if len(res.Warnings) != 0 || res.Incomplete["me/app"] {
+		t.Errorf("warnings = %v, incomplete = %v; want none", res.Warnings, res.Incomplete)
+	}
+}
+
+func TestInvalidUsesMarksIncomplete(t *testing.T) {
+	s := &Scanner{Fetcher: &fakeFetcher{}, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{
+		Name: "o/r", Files: []File{workflowFile("$/.github/actions/x@v1", "checkout@v4")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Incomplete["o/r"] || len(res.Warnings) != 2 || len(res.Findings) != 0 {
+		t.Errorf("incomplete = %v, warnings = %v, findings = %+v; want incomplete with two warnings", res.Incomplete, res.Warnings, briefs(res.Findings))
+	}
+}

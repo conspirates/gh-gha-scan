@@ -14,6 +14,8 @@ func TestParse(t *testing.T) {
 		pinned bool
 	}{
 		{"./.github/actions/setup", Ref{Kind: Local, Path: ".github/actions/setup"}, false},
+		{"$/.github/actions/setup", Ref{Kind: Self, Path: ".github/actions/setup"}, false},
+		{"$/.github/actions/setup@v1", Ref{Kind: Invalid}, false},
 		{"docker://alpine:3.20", Ref{Kind: Docker}, false},
 		{"actions/checkout@v4", Ref{Kind: Action, Owner: "actions", Repo: "checkout", Ref: "v4"}, false},
 		{"actions/checkout@" + sha, Ref{Kind: Action, Owner: "actions", Repo: "checkout", Ref: sha}, true},
@@ -46,6 +48,8 @@ func TestCandidates(t *testing.T) {
 		"o/r/.github/workflows/x.yml@v1": {".github/workflows/x.yml"},
 		"./.github/actions/setup":        {".github/actions/setup/action.yml", ".github/actions/setup/action.yaml"},
 		"./.github/workflows/reuse.yml":  {".github/workflows/reuse.yml"},
+		"$/.github/actions/setup":        {".github/actions/setup/action.yml", ".github/actions/setup/action.yaml"},
+		"$/.github/workflows/reuse.yml":  {".github/workflows/reuse.yml"},
 	}
 	for in, want := range tests {
 		if got := Parse(in).Candidates(); !reflect.DeepEqual(got, want) {

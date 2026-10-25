@@ -163,7 +163,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 				continue
 			}
 			rootUses[i][j] = uses
-			level = append(level, sc.targets(root, uses)...)
+			level = append(level, sc.targets(root, nil, uses)...)
 		}
 	}
 
@@ -189,7 +189,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 				continue
 			}
 			expanded[ek] = true
-			next = append(next, sc.targets(t.root, n.uses)...)
+			next = append(next, sc.targets(t.root, n, n.uses)...)
 		}
 		level = next
 	}
@@ -199,7 +199,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 		root := &roots[i]
 		for j, f := range root.Files {
 			for _, u := range rootUses[i][j] {
-				sc.walk(&res, root, f.Path, u, u, "", nil, 1, map[string]bool{}, nil)
+				sc.walk(&res, root, f.Path, u, u, nil, nil, 1, map[string]bool{}, nil)
 			}
 		}
 	}
@@ -227,17 +227,29 @@ func (sc *scanner) warnOnce(format string, args ...any) {
 }
 
 // targets resolves the references in uses that point at fetchable content.
-func (sc *scanner) targets(root *Root, uses []workflow.Use) []target {
+// in is the node that uses were read from, or nil for a root workflow file.
+func (sc *scanner) targets(root *Root, in *node, uses []workflow.Use) []target {
 	var ts []target
 	for _, u := range uses {
-		if t, ok := resolve(root, ref.Parse(u.Value)); ok {
+		if t, ok := resolve(root, in, ref.Parse(u.Value)); ok {
 			ts = append(ts, t)
 		}
 	}
 	return ts
 }
 
-func resolve(root *Root, r ref.Ref) (target, bool) {
+// resolve finds what r points at. ./local refs resolve against the root,
+// since they are relative to the checked-out workspace. $/ refs resolve
+// against the repository and commit of the file they are written in, in.
+func resolve(root *Root, in *node, r ref.Ref) (target, bool) {
+	if r.Kind == ref.Self {
+		if in != nil && in.repo != "" {
+			owner, repo, _ := strings.Cut(in.repo, "/")
+			return resolveAt(root, r, owner, repo, in.at), true
+		}
+		// In the root's own files, $/ and ./ both mean the root.
+		r.Kind = ref.Local
+	}
 	switch {
 	case r.IsRemote():
 		return target{key: r.Key(), ref: r, root: root}, true
@@ -245,14 +257,20 @@ func resolve(root *Root, r ref.Ref) (target, bool) {
 		return target{key: "local:" + root.Name + ":" + r.Path, ref: r, root: root, local: true}, true
 	case r.Kind == ref.Local && root.HeadOID != "":
 		owner, repo, _ := strings.Cut(root.Repo, "/")
-		kind := ref.Action
-		if ref.IsWorkflowPath(r.Path) {
-			kind = ref.Workflow
-		}
-		r = ref.Ref{Raw: r.Raw, Kind: kind, Owner: owner, Repo: repo, Path: r.Path, Ref: root.HeadOID}
-		return target{key: r.Key(), ref: r, root: root}, true
+		return resolveAt(root, r, owner, repo, root.HeadOID), true
 	}
 	return target{}, false
+}
+
+// resolveAt resolves a path in the same repository as a remote reference to
+// owner/repo at commit.
+func resolveAt(root *Root, r ref.Ref, owner, repo, at string) target {
+	kind := ref.Action
+	if ref.IsWorkflowPath(r.Path) {
+		kind = ref.Workflow
+	}
+	r = ref.Ref{Raw: r.Raw, Kind: kind, Owner: owner, Repo: repo, Path: r.Path, Ref: at}
+	return target{key: r.Key(), ref: r, root: root}
 }
 
 // load fetches every target that is not loaded yet, remote ones in one batch.
@@ -323,16 +341,22 @@ func (sc *scanner) addNode(key string, n *node, data []byte) {
 }
 
 // walk reports u if it is unpinned and descends into what it references.
-// start is the use in the root file where the chain began, src the location
-// of u when it is not in the root file. direct is the first remote reference
-// on the chain, or nil while the chain has only passed through local actions.
-func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.Use, src string, via []string, depth int, onPath map[string]bool, direct *Direct) {
+// start is the use in the root file where the chain began, in the node that
+// u is written in, or nil when u is in the root file. direct is the first
+// remote reference on the chain, or nil while the chain has only passed
+// through local actions.
+func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.Use, in *node, via []string, depth int, onPath map[string]bool, direct *Direct) {
+	src := ""
+	if in != nil {
+		src = in.loc(root)
+	}
 	r := ref.Parse(u.Value)
 	if r.Kind == ref.Invalid {
 		sc.warn("%s: %s:%d: cannot parse uses %q", root.Name, file, start.Line, u.Value)
+		res.Incomplete[root.Name] = true
 		return
 	}
-	t, ok := resolve(root, r)
+	t, ok := resolve(root, in, r)
 	if !ok {
 		return
 	}
@@ -370,7 +394,7 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 		return
 	}
 	if depth >= sc.Depth {
-		if len(sc.targets(root, n.uses)) > 0 {
+		if len(sc.targets(root, n, n.uses)) > 0 {
 			sc.warnOnce("%s: stopped at --depth %d; refs inside %s were not checked", root.Name, sc.Depth, n.loc(root))
 			res.Incomplete[root.Name] = true
 		}
@@ -380,7 +404,7 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 	defer delete(onPath, t.key)
 	via = append(via[:len(via):len(via)], label(u))
 	for _, c := range n.uses {
-		sc.walk(res, root, file, start, c, n.loc(root), via, depth+1, onPath, direct)
+		sc.walk(res, root, file, start, c, n, via, depth+1, onPath, direct)
 	}
 }
 

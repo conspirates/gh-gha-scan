@@ -58,12 +58,13 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 | No fix upstream yet | Even the newest release still uses unpinned refs: fork it, replace it, or ask upstream to pin. |
 | No verified fix | Part of the newest release couldn't be read, so it isn't known to be fully pinned. The warnings say what failed. |
 
-A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it.
+A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read, couldn't be parsed or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it.
 
 ## What counts
 
 - `owner/repo[/path]@ref` and `owner/repo/.github/workflows/x.yml@ref` are findings unless `ref` is a full 40-character SHA. Short SHAs, tags and branches all count.
 - `./local` actions are not findings themselves, but they are read (from the default branch, or from disk with `--local`) and their nested refs are checked.
+- `$/path` refs (same repository, at the running commit) aren't findings either. They're read from the repository of the file they're written in: the scanned repository itself, or the dependency at the ref it was called with. A `$/` ref with `@ref` is invalid.
 - `docker://` images are ignored, since the policy covers actions only.
 - Only top-level `.github/workflows/*.yml` and `*.yaml` files are scanned, as GitHub only runs those.
 
