@@ -112,10 +112,21 @@ type Scanner struct {
 
 // node is a fetched action or reusable workflow.
 type node struct {
-	loc      string // where it was read from, for Finding.Source
-	uses     []workflow.Use
-	hasLocal bool
-	sha      string
+	// repo, path and at say where the node was read. repo is empty for a
+	// file read from a local checkout, where path alone locates it.
+	repo, path, at string
+	uses           []workflow.Use
+	sha            string
+}
+
+// loc locates n for Finding.Source and Direct.File. A file in root's own
+// repository at the commit being scanned is shown by its path in the
+// repository, as in a local scan.
+func (n *node) loc(root *Root) string {
+	if n.repo == "" || (strings.EqualFold(n.repo, root.Repo) && n.at == root.HeadOID) {
+		return n.path
+	}
+	return n.repo + "/" + n.path + "@" + n.at
 }
 
 // target is a reference resolved in the context of a root.
@@ -168,12 +179,10 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 			if n == nil {
 				continue
 			}
-			// ./local refs inside a node resolve against the root, so a node
-			// with them is expanded once per root.
-			ek := t.key
-			if n.hasLocal {
-				ek += "|" + t.root.Name
-			}
+			// ./local refs anywhere below a node resolve against the root, so
+			// each node is expanded once per root. Files are still fetched
+			// only once, since load skips keys it already has.
+			ek := t.key + "|" + t.root.Name
 			if expanded[ek] {
 				continue
 			}
@@ -275,7 +284,7 @@ func (sc *scanner) load(ctx context.Context, ts []target) error {
 			sc.warn("%s: none of %s found", name, strings.Join(req.Paths, ", "))
 			sc.missing[k] = true
 		default:
-			sc.addNode(k, fmt.Sprintf("%s/%s/%s@%s", req.Owner, req.Repo, res.Path, req.Ref), []byte(res.Text), res.SHA)
+			sc.addNode(k, &node{repo: req.Owner + "/" + req.Repo, path: res.Path, at: req.Ref, sha: res.SHA}, []byte(res.Text))
 		}
 	}
 	return nil
@@ -285,7 +294,7 @@ func (sc *scanner) loadLocal(t target) {
 	for _, p := range t.ref.Candidates() {
 		data, err := t.root.ReadLocal(p)
 		if err == nil {
-			sc.addNode(t.key, p, data, "")
+			sc.addNode(t.key, &node{path: p}, data)
 			return
 		}
 	}
@@ -293,17 +302,12 @@ func (sc *scanner) loadLocal(t target) {
 	sc.missing[t.key] = true
 }
 
-func (sc *scanner) addNode(key, loc string, data []byte, sha string) {
+func (sc *scanner) addNode(key string, n *node, data []byte) {
 	uses, err := workflow.Extract(data)
 	if err != nil {
-		sc.warn("%s: %v", loc, err)
+		sc.warn("%s: %v", n.loc(&Root{}), err)
 	}
-	n := &node{loc: loc, uses: uses, sha: sha}
-	for _, u := range uses {
-		if ref.Parse(u.Value).Kind == ref.Local {
-			n.hasLocal = true
-		}
-	}
+	n.uses = uses
 	sc.nodes[key] = n
 }
 
@@ -358,7 +362,7 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 	defer delete(onPath, t.key)
 	via = append(via[:len(via):len(via)], label(u))
 	for _, c := range n.uses {
-		sc.walk(res, root, file, start, c, n.loc, via, depth+1, onPath, direct)
+		sc.walk(res, root, file, start, c, n.loc(root), via, depth+1, onPath, direct)
 	}
 }
 

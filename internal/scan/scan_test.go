@@ -294,3 +294,60 @@ func (r *recordingFetcher) Fetch(ctx context.Context, reqs map[string]FileReq) (
 	}
 	return r.inner.Fetch(ctx, reqs)
 }
+
+func TestLocalRefsBelowSharedDependencyAreFollowedForEveryRoot(t *testing.T) {
+	// x/a has no local refs itself, but y/b below it does.
+	f := &fakeFetcher{actions: map[string][]string{
+		"x/a/@v1":        {"y/b@" + pinned},
+		"y/b/@" + pinned: {"./.github/actions/setup"},
+		"ext/one/@v1":    {},
+		"ext/two/@v1":    {},
+	}}
+	local := func(uses string) func(string) ([]byte, error) {
+		return func(p string) ([]byte, error) {
+			if p == ".github/actions/setup/action.yml" {
+				return []byte(composite(uses)), nil
+			}
+			return nil, errors.New("not found")
+		}
+	}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{
+		{Name: "o/one", ReadLocal: local("ext/one@v1"), Files: []File{workflowFile("x/a@v1")}},
+		{Name: "o/two", ReadLocal: local("ext/two@v1"), Files: []File{workflowFile("x/a@v1")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range res.Findings {
+		got[f.Repo+" "+f.Uses] = true
+	}
+	for _, want := range []string{"o/one ext/one@v1", "o/two ext/two@v1"} {
+		if !got[want] {
+			t.Errorf("missing finding %q; got %v", want, got)
+		}
+	}
+}
+
+func TestRemoteRootShowsLocalActionPathInRepo(t *testing.T) {
+	f := &fakeFetcher{actions: map[string][]string{
+		"me/repo/.github/actions/x@" + pinned: {"ext/a@v1"},
+		"ext/a/@v1":                           {},
+	}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{
+		Name: "me/repo", Repo: "me/repo", HeadOID: pinned,
+		Files: []File{workflowFile("./.github/actions/x")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Findings) != 1 {
+		t.Fatalf("got %+v", res.Findings)
+	}
+	f0 := res.Findings[0]
+	if f0.Direct.File != ".github/actions/x/action.yml" || f0.Source != ".github/actions/x/action.yml:4" {
+		t.Errorf("Direct.File = %q, Source = %q; want paths in the repository", f0.Direct.File, f0.Source)
+	}
+}
