@@ -82,13 +82,15 @@ func Parse(s string) Ref {
 		r.Path = strings.Trim(parts[2], "/")
 	}
 	r.Kind = Action
-	if isWorkflowPath(r.Path) {
+	if IsWorkflowPath(r.Path) {
 		r.Kind = Workflow
 	}
 	return r
 }
 
-func isWorkflowPath(p string) bool {
+// IsWorkflowPath reports whether p is a workflow file, i.e. a reusable
+// workflow rather than an action directory.
+func IsWorkflowPath(p string) bool {
 	return strings.HasPrefix(p, ".github/workflows/") &&
 		(strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml"))
 }
@@ -115,9 +117,10 @@ func (r Ref) Key() string {
 }
 
 // Candidates returns the file paths that may hold r's definition, in the
-// order GitHub looks them up.
+// order GitHub looks them up. A local ref to a workflow file is a reusable
+// workflow in the same repository, so it is the file itself.
 func (r Ref) Candidates() []string {
-	if r.Kind == Workflow {
+	if r.Kind == Workflow || (r.Kind == Local && IsWorkflowPath(r.Path)) {
 		return []string{r.Path}
 	}
 	dir := r.Path

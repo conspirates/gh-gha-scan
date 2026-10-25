@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/conspirates/gh-gha-scan/internal/ref"
 	"github.com/conspirates/gh-gha-scan/internal/scan"
@@ -31,8 +32,15 @@ func DefaultDir() (string, error) {
 	return filepath.Join(dir, "gh-gha-scan"), nil
 }
 
-func (f *Fetcher) path(key string) string {
-	sum := sha256.Sum256([]byte(key))
+// version is part of every entry's name. Bump it when the meaning of a
+// request or the FileRes format changes, so old entries are never read.
+const version = "2"
+
+// path names the entry for req. The paths looked up are part of the name,
+// so a change in how candidates are chosen can't reuse an old answer.
+func (f *Fetcher) path(key string, req scan.FileReq) string {
+	id := version + "\x00" + key + "\x00" + strings.Join(req.Paths, "\x00")
+	sum := sha256.Sum256([]byte(id))
 	return filepath.Join(f.Dir, hex.EncodeToString(sum[:])+".json")
 }
 
@@ -46,7 +54,7 @@ func (f *Fetcher) Fetch(ctx context.Context, reqs map[string]scan.FileReq) (map[
 	rest := map[string]scan.FileReq{}
 	for k, req := range reqs {
 		if cacheable(req) {
-			if data, err := os.ReadFile(f.path(k)); err == nil {
+			if data, err := os.ReadFile(f.path(k, req)); err == nil {
 				var res scan.FileRes
 				if json.Unmarshal(data, &res) == nil {
 					out[k] = res
@@ -64,16 +72,17 @@ func (f *Fetcher) Fetch(ctx context.Context, reqs map[string]scan.FileReq) (map[
 	got, err := f.Inner.Fetch(ctx, rest)
 	for k, res := range got {
 		out[k] = res
-		// Errors such as an inaccessible repository may be temporary.
-		if cacheable(rest[k]) && res.Err == "" {
-			f.store(k, res)
+		// Only found files are kept. An inaccessible repository or a missing
+		// file may be temporary, so those are asked again next time.
+		if cacheable(rest[k]) && res.Found && res.Err == "" {
+			f.store(f.path(k, rest[k]), res)
 		}
 	}
 	return out, err
 }
 
 // store writes an entry, ignoring failures: the cache is only an optimization.
-func (f *Fetcher) store(key string, res scan.FileRes) {
+func (f *Fetcher) store(path string, res scan.FileRes) {
 	data, err := json.Marshal(res)
 	if err != nil {
 		return
@@ -91,7 +100,7 @@ func (f *Fetcher) store(key string, res scan.FileRes) {
 		os.Remove(tmp.Name())
 		return
 	}
-	if err := os.Rename(tmp.Name(), f.path(key)); err != nil {
+	if err := os.Rename(tmp.Name(), path); err != nil {
 		os.Remove(tmp.Name())
 	}
 }

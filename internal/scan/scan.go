@@ -222,7 +222,11 @@ func resolve(root *Root, r ref.Ref) (target, bool) {
 		return target{key: "local:" + root.Name + ":" + r.Path, ref: r, root: root, local: true}, true
 	case r.Kind == ref.Local && root.HeadOID != "":
 		owner, repo, _ := strings.Cut(root.Repo, "/")
-		r = ref.Ref{Raw: r.Raw, Kind: ref.Action, Owner: owner, Repo: repo, Path: r.Path, Ref: root.HeadOID}
+		kind := ref.Action
+		if ref.IsWorkflowPath(r.Path) {
+			kind = ref.Workflow
+		}
+		r = ref.Ref{Raw: r.Raw, Kind: kind, Owner: owner, Repo: repo, Path: r.Path, Ref: root.HeadOID}
 		return target{key: r.Key(), ref: r, root: root}, true
 	}
 	return target{}, false
@@ -282,7 +286,7 @@ func (sc *scanner) loadLocal(t target) {
 			return
 		}
 	}
-	sc.warn("%s: %s: no action.yml or action.yaml", t.root.Name, t.ref.Raw)
+	sc.warn("%s: %s: none of %s found", t.root.Name, t.ref.Raw, strings.Join(t.ref.Candidates(), ", "))
 	sc.missing[t.key] = true
 }
 

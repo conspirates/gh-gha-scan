@@ -236,3 +236,61 @@ func TestRemoteRootResolvesLocalAtHead(t *testing.T) {
 		t.Errorf("findings = %+v, want %+v", got, want)
 	}
 }
+
+func TestLocalReusableWorkflow(t *testing.T) {
+	reusable := "jobs:\n  build:\n    steps:\n      - uses: ext/a@v1\n"
+	read := func(p string) ([]byte, error) {
+		if p == ".github/workflows/reuse.yml" {
+			return []byte(reusable), nil
+		}
+		return nil, errors.New("not found")
+	}
+	f := &fakeFetcher{actions: map[string][]string{"ext/a/@v1": {}}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	caller := File{Path: ".github/workflows/ci.yml", Text: "jobs:\n  call:\n    uses: ./.github/workflows/reuse.yml\n"}
+	res, err := s.Scan(context.Background(), []Root{{Name: "me/app", ReadLocal: read, Files: []File{caller}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []brief{{"ext/a@v1", []string{"./.github/workflows/reuse.yml"}}}
+	if got := briefs(res.Findings); !reflect.DeepEqual(got, want) {
+		t.Errorf("findings = %+v, want %+v", got, want)
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none", res.Warnings)
+	}
+}
+
+func TestRemoteRootResolvesLocalReusableWorkflowAtHead(t *testing.T) {
+	f := &fakeFetcher{actions: map[string][]string{
+		"me/repo/.github/workflows/reuse.yml@" + pinned: {"ext/a@v1"},
+		"ext/a/@v1": {},
+	}}
+	rec := &recordingFetcher{inner: f, reqs: map[string]FileReq{}}
+	s := &Scanner{Fetcher: rec, Depth: 10}
+	caller := File{Path: ".github/workflows/ci.yml", Text: "jobs:\n  call:\n    uses: ./.github/workflows/reuse.yml\n"}
+	res, err := s.Scan(context.Background(), []Root{{Name: "me/repo", Repo: "me/repo", HeadOID: pinned, Files: []File{caller}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Findings) != 1 || res.Findings[0].Uses != "ext/a@v1" || len(res.Warnings) != 0 {
+		t.Errorf("findings = %+v, warnings = %v", briefs(res.Findings), res.Warnings)
+	}
+	req := rec.reqs["me/repo/.github/workflows/reuse.yml@"+pinned]
+	if !reflect.DeepEqual(req.Paths, []string{".github/workflows/reuse.yml"}) {
+		t.Errorf("requested paths %v, want the workflow file itself", req.Paths)
+	}
+}
+
+// recordingFetcher remembers the last request for each key.
+type recordingFetcher struct {
+	inner Fetcher
+	reqs  map[string]FileReq
+}
+
+func (r *recordingFetcher) Fetch(ctx context.Context, reqs map[string]FileReq) (map[string]FileRes, error) {
+	for k, req := range reqs {
+		r.reqs[k] = req
+	}
+	return r.inner.Fetch(ctx, reqs)
+}

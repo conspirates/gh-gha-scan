@@ -44,6 +44,8 @@ func TestCandidates(t *testing.T) {
 		"o/r@v1":                         {"action.yml", "action.yaml"},
 		"o/r/sub/dir@v1":                 {"sub/dir/action.yml", "sub/dir/action.yaml"},
 		"o/r/.github/workflows/x.yml@v1": {".github/workflows/x.yml"},
+		"./.github/actions/setup":        {".github/actions/setup/action.yml", ".github/actions/setup/action.yaml"},
+		"./.github/workflows/reuse.yml":  {".github/workflows/reuse.yml"},
 	}
 	for in, want := range tests {
 		if got := Parse(in).Candidates(); !reflect.DeepEqual(got, want) {
