@@ -72,7 +72,24 @@ type Finding struct {
 	// Source locates Uses when it is not in File itself.
 	Source       string `json:"source,omitempty"`
 	SuggestedSHA string `json:"suggested_sha,omitempty"`
+	// Direct is the action or reusable workflow that Repo itself calls and
+	// that leads to Uses. It equals Uses when Uses is not transitive.
+	Direct Direct `json:"direct"`
 }
+
+// Direct is a reference written in the scanned repository: in a workflow, or
+// in one of the repository's own local actions.
+type Direct struct {
+	Uses string `json:"uses"`
+	// Comment is the trailing comment, usually the version of a pinned SHA.
+	Comment string `json:"comment,omitempty"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+}
+
+// IsTransitive reports whether f's unpinned reference is inside another
+// action or reusable workflow rather than written in the repository.
+func (f Finding) IsTransitive() bool { return f.Uses != f.Direct.Uses }
 
 // Result is the outcome of a scan.
 type Result struct {
@@ -168,7 +185,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 		root := &roots[i]
 		for j, f := range root.Files {
 			for _, u := range rootUses[i][j] {
-				sc.walk(&res, root, f.Path, u, u, "", nil, 1, map[string]bool{})
+				sc.walk(&res, root, f.Path, u, u, "", nil, 1, map[string]bool{}, nil)
 			}
 		}
 	}
@@ -285,8 +302,9 @@ func (sc *scanner) addNode(key, loc string, data []byte, sha string) {
 
 // walk reports u if it is unpinned and descends into what it references.
 // start is the use in the root file where the chain began, src the location
-// of u when it is not in the root file.
-func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.Use, src string, via []string, depth int, onPath map[string]bool) {
+// of u when it is not in the root file. direct is the first remote reference
+// on the chain, or nil while the chain has only passed through local actions.
+func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.Use, src string, via []string, depth int, onPath map[string]bool, direct *Direct) {
 	r := ref.Parse(u.Value)
 	if r.Kind == ref.Invalid {
 		sc.warn("%s: %s:%d: cannot parse uses %q", root.Name, file, start.Line, u.Value)
@@ -296,12 +314,20 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 	if !ok {
 		return
 	}
+	if direct == nil && r.IsRemote() {
+		loc := file
+		if src != "" {
+			loc = src
+		}
+		direct = &Direct{Uses: u.Value, Comment: u.Comment, File: loc, Line: u.Line}
+	}
 	if r.IsRemote() && !r.IsPinned() {
 		f := Finding{
 			Repo: root.Name, File: file, Line: start.Line,
 			Uses: u.Value, Kind: r.Kind.String(),
 			External: root.Owner == "" || !strings.EqualFold(r.Owner, root.Owner),
 			Via:      via,
+			Direct:   *direct,
 		}
 		if src != "" {
 			f.Source = fmt.Sprintf("%s:%d", src, u.Line)
@@ -322,7 +348,7 @@ func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.
 	defer delete(onPath, t.key)
 	via = append(via[:len(via):len(via)], label(u))
 	for _, c := range n.uses {
-		sc.walk(res, root, file, start, c, n.loc, via, depth+1, onPath)
+		sc.walk(res, root, file, start, c, n.loc, via, depth+1, onPath, direct)
 	}
 }
 

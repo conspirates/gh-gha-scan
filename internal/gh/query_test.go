@@ -54,3 +54,16 @@ func TestCommitPeelsTags(t *testing.T) {
 		}
 	}
 }
+
+func TestTagsQuery(t *testing.T) {
+	q := tagsQuery([]string{"actions/checkout", "o/r"})
+	for _, want := range []string{
+		`t0: repository(owner: "actions", name: "checkout")`,
+		`t1: repository(owner: "o", name: "r")`,
+		`refs(refPrefix: "refs/tags/", first: 50, orderBy: {field: TAG_COMMIT_DATE, direction: DESC})`,
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query missing %q:\n%s", want, q)
+		}
+	}
+}

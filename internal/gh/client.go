@@ -16,6 +16,7 @@ import (
 
 	"github.com/cli/go-gh/v2/pkg/api"
 
+	"github.com/conspirates/gh-gha-scan/internal/fix"
 	"github.com/conspirates/gh-gha-scan/internal/scan"
 )
 
@@ -270,6 +271,34 @@ func (c *Client) text(ctx context.Context, repo, commit, p string, b *blob) (str
 		return "", fmt.Errorf("read %s/%s: %w", repo, p, err)
 	}
 	return string(data), nil
+}
+
+// Tags implements fix.TagLister with batched GraphQL queries. Repositories
+// that cannot be read have no entry.
+func (c *Client) Tags(ctx context.Context, repos []string) (map[string][]fix.Tag, error) {
+	out := map[string][]fix.Tag{}
+	for start := 0; start < len(repos); start += BatchSize {
+		chunk := repos[start:min(start+BatchSize, len(repos))]
+		var resp map[string]*struct {
+			Refs struct {
+				Nodes []tagNode `json:"nodes"`
+			} `json:"refs"`
+		}
+		err := c.do(ctx, tagsQuery(chunk), nil, &resp)
+		if _, err := notFound(err); err != nil {
+			return nil, err
+		}
+		for i, r := range chunk {
+			repo := resp[fmt.Sprintf("t%d", i)]
+			if repo == nil {
+				continue
+			}
+			for _, n := range repo.Refs.Nodes {
+				out[strings.ToLower(r)] = append(out[strings.ToLower(r)], fix.Tag{Name: n.Name, SHA: n.Target.commit()})
+			}
+		}
+	}
+	return out, nil
 }
 
 // Fetch implements scan.Fetcher with batched GraphQL queries.

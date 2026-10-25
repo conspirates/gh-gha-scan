@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/conspirates/gh-gha-scan/internal/cache"
+	"github.com/conspirates/gh-gha-scan/internal/fix"
 	"github.com/conspirates/gh-gha-scan/internal/gh"
 	"github.com/conspirates/gh-gha-scan/internal/report"
 	"github.com/conspirates/gh-gha-scan/internal/scan"
@@ -29,7 +30,6 @@ type options struct {
 	depth           int
 	includeArchived bool
 	includeForks    bool
-	resolve         bool
 	exitCode        bool
 	noCache         bool
 }
@@ -49,7 +49,7 @@ unpinned references inside pinned third-party actions are reported too.`,
 		Example: `  gh gha-scan cli/cli
   gh gha-scan --owner cli
   gh gha-scan --local .
-  gh gha-scan --owner my-org --json | jq '.unpinned'`,
+  gh gha-scan --owner my-org --json | jq '.repositories[] | select(.items != [])'`,
 		Args:          cobra.MaximumNArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -64,7 +64,6 @@ unpinned references inside pinned third-party actions are reported too.`,
 	f.IntVar(&opts.depth, "depth", 10, "maximum depth of transitive references to follow")
 	f.BoolVar(&opts.includeArchived, "include-archived", false, "include archived repositories with --owner")
 	f.BoolVar(&opts.includeForks, "include-forks", false, "include forks with --owner")
-	f.BoolVar(&opts.resolve, "resolve", false, "look up the commit SHA for each unpinned reference")
 	f.BoolVar(&opts.exitCode, "exit-code", false, "exit with status 1 when unpinned references are found")
 	f.BoolVar(&opts.noCache, "no-cache", false, "do not use the on-disk cache for pinned references")
 
@@ -135,26 +134,30 @@ func run(ctx context.Context, opts *options, args []string) error {
 		}
 	}
 
-	s := &scan.Scanner{Fetcher: fetcher, Depth: opts.depth, Resolve: opts.resolve}
+	// Fixes need the commit SHA of every unpinned reference.
+	s := &scan.Scanner{Fetcher: fetcher, Depth: opts.depth, Resolve: true}
 	res, err := s.Scan(ctx, roots)
+	if err != nil {
+		return err
+	}
+	planner := &fix.Planner{Scanner: s, Tags: client}
+	repos, err := planner.Plan(ctx, roots, res)
 	if err != nil {
 		return err
 	}
 
 	stats := client.Stats()
 	if opts.json {
-		if err := report.JSON(os.Stdout, res, len(roots), stats); err != nil {
+		if err := report.JSON(os.Stdout, repos, res.Warnings, stats); err != nil {
 			return err
 		}
 	} else {
 		t := term.FromEnv()
 		width, _, _ := t.Size()
-		if len(res.Findings) > 0 {
-			if err := report.Table(t.Out(), res.Findings, t.IsTerminalOutput(), width); err != nil {
-				return err
-			}
+		if err := report.Table(t.Out(), repos, t.IsTerminalOutput(), width); err != nil {
+			return err
 		}
-		report.Summary(t.ErrOut(), res, len(roots))
+		report.Summary(t.ErrOut(), repos, res.Warnings)
 		msg := "\nAPI: no GraphQL queries"
 		if stats.Queries > 0 {
 			msg = fmt.Sprintf("\nAPI: %d GraphQL queries, %d points used, %d remaining", stats.Queries, stats.Cost, stats.Remaining)
@@ -189,10 +192,12 @@ func localRoot(dir string) (scan.Root, error) {
 	if err != nil {
 		return scan.Root{}, err
 	}
+	// Name the checkout after its origin remote when there is one.
 	root := scan.Root{Name: dir}
 	if out, err := exec.Command("git", "-C", abs, "remote", "get-url", "origin").Output(); err == nil {
 		if r, err := repository.Parse(strings.TrimSpace(string(out))); err == nil {
 			root.Owner = r.Owner
+			root.Name = r.Owner + "/" + r.Name
 		}
 	}
 
