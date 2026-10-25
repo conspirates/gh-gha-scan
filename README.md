@@ -12,7 +12,7 @@ gh extension install conspirates/gh-gha-scan
 Each release includes prebuilt binaries with signed build provenance. Verify the downloaded release asset, not the installed binary: on macOS, `gh extension install` re-signs the binary, so its hash no longer matches and verification fails with HTTP 404.
 
 ```sh
-gh release download v0.3.0 -R conspirates/gh-gha-scan -p darwin-arm64   # or your platform
+gh release download v0.4.0 -R conspirates/gh-gha-scan -p darwin-arm64   # or your platform
 gh attestation verify darwin-arm64 -R conspirates/gh-gha-scan
 ```
 
