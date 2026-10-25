@@ -71,7 +71,7 @@ A repository shows `None (incomplete, see warnings)` instead of `None` when some
 - `source_owner` and `source_external` say who owns the file it's written in;
 - `boundary` is the reference to change to fix it, in a file the repository's owner controls.
 
-A ref that follows a branch is named in the fix: "on branch `<name>`", plus a release tag to consider when it's only pinned to the branch's head. If the branch head still has unpinned refs but the newest release doesn't, the fix is to upgrade to the release ("currently on branch `<name>`"). A name counts as a branch only when the repository has a branch and no tag of that name; a comment counts only when it's exactly one name that isn't a version.
+A ref that follows a branch is named in the fix: "on branch `<name>`", plus a release tag to consider when it's only pinned to the branch's head. If the branch head still has unpinned refs but the newest release doesn't, the fix is to upgrade to the release ("currently on branch `<name>`"). A name counts as a branch only when the repository has a branch and no tag of that name; a comment counts only when it's exactly one name that isn't a version. Prefer the suggested release tag when there is one: some projects rewrite branches (force-push them), e.g. `dtolnay/rust-toolchain`'s `stable` and `nightly`, and a SHA pinned from such a branch can later become unreachable and break the workflow. Tags are rarely rewritten.
 
 An item whose `fix_kind` is `none` has a `reason`: `no-upstream-fix`, `unverified` or `removed`.
 
