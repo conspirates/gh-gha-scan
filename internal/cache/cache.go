@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/conspirates/gh-gha-scan/internal/ref"
@@ -115,22 +116,58 @@ func (f *Fetcher) Fetch(ctx context.Context, reqs map[string]scan.FileReq) (map[
 		// Only found files are kept. An inaccessible repository or a missing
 		// file may be temporary, so those are asked again next time.
 		if f.cacheable(rest[k]) && res.Found && res.Err == "" {
-			f.store(f.path(k, rest[k]), entry{Stored: f.clock(), Res: res})
+			write(f.Dir, f.path(k, rest[k]), entry{Stored: f.clock(), Res: res})
 		}
 	}
 	return out, err
 }
 
-// store writes an entry, ignoring failures: the cache is only an optimization.
-func (f *Fetcher) store(path string, e entry) {
-	data, err := json.Marshal(e)
+// Roots keeps the top-level workflow files of repositories by commit, for
+// gh.Client.Roots. Files at a commit never change, so entries never expire.
+type Roots struct {
+	Dir string
+	// Hits counts repositories served from disk.
+	Hits atomic.Int64
+}
+
+func (r *Roots) path(repo, commit string) string {
+	sum := sha256.Sum256([]byte(version + "\x00roots\x00" + strings.ToLower(repo) + "\x00" + commit))
+	return filepath.Join(r.Dir, hex.EncodeToString(sum[:])+".json")
+}
+
+// Files returns the workflow files of repo at commit, if they are cached.
+func (r *Roots) Files(repo, commit string) ([]scan.File, bool) {
+	data, err := os.ReadFile(r.path(repo, commit))
+	if err != nil {
+		return nil, false
+	}
+	var files []scan.File
+	if json.Unmarshal(data, &files) != nil {
+		return nil, false
+	}
+	r.Hits.Add(1)
+	return files, true
+}
+
+// StoreFiles caches the workflow files of repo at commit.
+func (r *Roots) StoreFiles(repo, commit string, files []scan.File) {
+	if files == nil {
+		files = []scan.File{}
+	}
+	write(r.Dir, r.path(repo, commit), files)
+}
+
+// write stores v as JSON at path in dir, ignoring failures: the cache is only
+// an optimization.
+func write(dir, path string, v any) {
+	data, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(f.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
-	tmp, err := os.CreateTemp(f.Dir, "tmp-*")
+	tmp, err := os.CreateTemp(dir, "tmp-*")
 	if err != nil {
 		return
 	}

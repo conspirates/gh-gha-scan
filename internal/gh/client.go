@@ -41,6 +41,8 @@ type Client struct {
 	// limits penalize parallel GraphQL, so keep it low; Stats counts the
 	// retries they cause.
 	Concurrency int
+	// Roots, if set, caches the workflow files of listed repositories.
+	Roots RootCache
 
 	mu    sync.Mutex
 	stats Stats
@@ -177,9 +179,17 @@ func notFound(err error) (map[string]string, error) {
 	return out, nil
 }
 
+// RootCache keeps the top-level workflow files of repositories by commit.
+// It must be safe for concurrent use.
+type RootCache interface {
+	Files(repo, commit string) ([]scan.File, bool)
+	StoreFiles(repo, commit string, files []scan.File)
+}
+
 // OwnerRepos lists the repositories of an organization or user, with their
-// workflow files. skippedForks counts the forks left out when includeForks
-// is false.
+// workflow files at the default branch commit. Files for a commit that
+// Roots already has are not fetched. skippedForks counts the forks left out
+// when includeForks is false.
 func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, includeForks bool) (repos []Repo, skippedForks int, err error) {
 	vars := map[string]any{"login": login}
 	if !includeArchived {
@@ -188,11 +198,8 @@ func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, 
 	if !includeForks {
 		vars["fork"] = false
 	}
-	// Some repositories have huge workflow files, so start small and shrink
-	// the page further if GitHub times out.
-	first := 25
+	var nodes []repoNode
 	for {
-		vars["first"] = first
 		var resp struct {
 			RepositoryOwner *struct {
 				Forks struct {
@@ -207,12 +214,7 @@ func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, 
 				} `json:"repositories"`
 			} `json:"repositoryOwner"`
 		}
-		err := c.do(ctx, ownerReposQuery, vars, &resp)
-		if isServerError(err) && first > 1 {
-			first /= 2
-			continue
-		}
-		if err != nil {
+		if err := c.do(ctx, ownerReposQuery, vars, &resp); err != nil {
 			return nil, 0, err
 		}
 		if resp.RepositoryOwner == nil {
@@ -221,19 +223,121 @@ func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, 
 		if !includeForks {
 			skippedForks = resp.RepositoryOwner.Forks.TotalCount
 		}
-		for _, n := range resp.RepositoryOwner.Repositories.Nodes {
-			r, err := c.repo(ctx, n)
-			if err != nil {
-				return nil, 0, err
-			}
-			repos = append(repos, r)
-		}
+		nodes = append(nodes, resp.RepositoryOwner.Repositories.Nodes...)
 		page := resp.RepositoryOwner.Repositories.PageInfo
 		if !page.HasNextPage {
-			return repos, skippedForks, nil
+			break
 		}
 		vars["after"] = page.EndCursor
 	}
+
+	repos = make([]Repo, len(nodes))
+	var need []repoNode
+	fetched := map[string]bool{}
+	for i, n := range nodes {
+		repos[i] = Repo{NameWithOwner: n.NameWithOwner, IsFork: n.IsFork, HeadOID: n.oid()}
+		if n.oid() == "" {
+			continue
+		}
+		if c.Roots != nil {
+			if files, ok := c.Roots.Files(n.NameWithOwner, n.oid()); ok {
+				repos[i].Files = files
+				continue
+			}
+		}
+		need = append(need, n)
+		fetched[n.NameWithOwner] = true
+	}
+	got, err := c.workflows(ctx, need)
+	if err != nil {
+		return nil, 0, err
+	}
+	// A repository deleted since it was listed has no entry and is dropped.
+	out := repos[:0]
+	for _, r := range repos {
+		if fetched[r.NameWithOwner] {
+			var ok bool
+			if r, ok = got[r.NameWithOwner]; !ok {
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	return out, skippedForks, nil
+}
+
+// workflows reads the workflow files of nodes at their default branch
+// commits, WorkflowsPerQuery repositories per query, and stores them in
+// Roots. Repositories that can no longer be read have no entry.
+func (c *Client) workflows(ctx context.Context, nodes []repoNode) (map[string]Repo, error) {
+	var (
+		mu       sync.Mutex
+		out      = map[string]Repo{}
+		firstErr error
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, max(c.Concurrency, 1))
+	)
+	for start := 0; start < len(nodes); start += WorkflowsPerQuery {
+		chunk := nodes[start:min(start+WorkflowsPerQuery, len(nodes))]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			repos, err := c.workflowsBatch(ctx, chunk)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			for _, r := range repos {
+				out[r.NameWithOwner] = r
+			}
+		}()
+	}
+	wg.Wait()
+	return out, firstErr
+}
+
+// workflowsBatch reads one batch, splitting it when GitHub times out.
+func (c *Client) workflowsBatch(ctx context.Context, nodes []repoNode) ([]Repo, error) {
+	var resp map[string]*struct {
+		Object json.RawMessage `json:"object"`
+	}
+	err := c.do(ctx, workflowsQuery(nodes), nil, &resp)
+	if isServerError(err) && len(nodes) > 1 {
+		half := len(nodes) / 2
+		a, err := c.workflowsBatch(ctx, nodes[:half])
+		if err != nil {
+			return nil, err
+		}
+		b, err := c.workflowsBatch(ctx, nodes[half:])
+		return append(a, b...), err
+	}
+	if _, err := notFound(err); err != nil {
+		return nil, err
+	}
+	var repos []Repo
+	for i, n := range nodes {
+		got := resp[fmt.Sprintf("r%d", i)]
+		if got == nil {
+			continue
+		}
+		if len(got.Object) > 0 {
+			if err := json.Unmarshal(got.Object, &n.Object); err != nil {
+				return nil, err
+			}
+		}
+		r, err := c.repo(ctx, n)
+		if err != nil {
+			return nil, err
+		}
+		if c.Roots != nil {
+			c.Roots.StoreFiles(r.NameWithOwner, r.HeadOID, r.Files)
+		}
+		repos = append(repos, r)
+	}
+	return repos, nil
 }
 
 // Repo returns one repository with its workflow files.

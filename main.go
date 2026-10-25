@@ -105,8 +105,17 @@ func run(ctx context.Context, opts *options, args []string) error {
 	if err != nil {
 		return err
 	}
+	var cacheDir string
+	var roots *cache.Roots
+	if !opts.noCache {
+		if dir, err := cache.DefaultDir(); err == nil {
+			cacheDir = dir
+			roots = &cache.Roots{Dir: dir}
+			client.Roots = roots
+		}
+	}
 
-	var roots []scan.Root
+	var targets []scan.Root
 	var skipped report.Skipped
 	var warnings []string
 	switch {
@@ -118,7 +127,7 @@ func run(ctx context.Context, opts *options, args []string) error {
 		skipped.Forks = skippedForks
 		skipped.Workflows, warnings = dropNotRunnable(ctx, client, repos)
 		for _, r := range repos {
-			roots = append(roots, remoteRoot(r))
+			targets = append(targets, remoteRoot(r))
 		}
 	case opts.local:
 		dir := "."
@@ -129,7 +138,7 @@ func run(ctx context.Context, opts *options, args []string) error {
 		if err != nil {
 			return err
 		}
-		roots = append(roots, root)
+		targets = append(targets, root)
 	default:
 		owner, name, ok := strings.Cut(args[0], "/")
 		if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
@@ -139,26 +148,24 @@ func run(ctx context.Context, opts *options, args []string) error {
 		if err != nil {
 			return err
 		}
-		roots = append(roots, remoteRoot(r))
+		targets = append(targets, remoteRoot(r))
 	}
 
 	var fetcher scan.Fetcher = client
 	var cached *cache.Fetcher
-	if !opts.noCache {
-		if dir, err := cache.DefaultDir(); err == nil {
-			cached = &cache.Fetcher{Inner: client, Dir: dir, TTL: time.Hour}
-			fetcher = cached
-		}
+	if cacheDir != "" {
+		cached = &cache.Fetcher{Inner: client, Dir: cacheDir, TTL: time.Hour}
+		fetcher = cached
 	}
 
 	// Fixes need the commit SHA of every unpinned reference.
 	s := &scan.Scanner{Fetcher: fetcher, Depth: opts.depth, Resolve: true}
-	res, err := s.Scan(ctx, roots)
+	res, err := s.Scan(ctx, targets)
 	if err != nil {
 		return err
 	}
 	planner := &fix.Planner{Scanner: s, Tags: client}
-	repos, err := planner.Plan(ctx, roots, res)
+	repos, err := planner.Plan(ctx, targets, res)
 	if err != nil {
 		return err
 	}
@@ -179,6 +186,9 @@ func run(ctx context.Context, opts *options, args []string) error {
 		msg := "\nAPI: no GraphQL queries"
 		if stats.Queries > 0 {
 			msg = fmt.Sprintf("\nAPI: %d GraphQL queries, %d points used, %d remaining", stats.Queries, stats.Cost, stats.Remaining)
+		}
+		if roots != nil && roots.Hits.Load() > 0 {
+			msg += fmt.Sprintf(", %d cached repositories", roots.Hits.Load())
 		}
 		if cached != nil && cached.Hits > 0 {
 			msg += fmt.Sprintf(", %d cached files", cached.Hits)

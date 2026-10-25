@@ -17,28 +17,50 @@ const rateLimitField = "rateLimit { cost remaining resetAt }"
 
 const blobFields = "... on Blob { text isTruncated isBinary }"
 
+// workflowsTree selects the top-level workflow files under a tree object.
+const workflowsTree = "... on Tree { entries { name type object { " + blobFields + " } } }"
+
 // repoFields selects a repository with the contents of its top-level
-// workflow files, so listing repos and reading workflows is one query.
+// workflow files.
 const repoFields = `fragment repoFields on Repository {
   nameWithOwner
   isFork
   defaultBranchRef { target { oid } }
-  object(expression: "HEAD:.github/workflows") {
-    ... on Tree { entries { name type object { ` + blobFields + ` } } }
-  }
+  object(expression: "HEAD:.github/workflows") { ` + workflowsTree + ` }
 }`
 
-const ownerReposQuery = `query($login: String!, $first: Int!, $after: String, $archived: Boolean, $fork: Boolean) {
+// ownerReposQuery lists repositories with only their default branch commit,
+// so that workflow files are fetched only for commits not cached yet.
+const ownerReposQuery = `query($login: String!, $after: String, $archived: Boolean, $fork: Boolean) {
   ` + rateLimitField + `
   repositoryOwner(login: $login) {
     forks: repositories(isFork: true, isArchived: $archived, ownerAffiliations: [OWNER]) { totalCount }
-    repositories(first: $first, after: $after, isArchived: $archived, isFork: $fork, ownerAffiliations: [OWNER], orderBy: {field: NAME, direction: ASC}) {
+    repositories(first: 100, after: $after, isArchived: $archived, isFork: $fork, ownerAffiliations: [OWNER], orderBy: {field: NAME, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { ...repoFields }
+      nodes { nameWithOwner isFork defaultBranchRef { target { oid } } }
     }
   }
+}`
+
+// WorkflowsPerQuery is how many repositories' workflow files are read per
+// query. Some repositories have huge workflow files, so it is small, and
+// halved further when GitHub times out.
+const WorkflowsPerQuery = 25
+
+// workflowsQuery reads the top-level workflow files of each repository at a
+// commit, aliased rN.
+func workflowsQuery(repos []repoNode) string {
+	var b strings.Builder
+	b.WriteString("query {\n  " + rateLimitField + "\n")
+	for i, r := range repos {
+		owner, name, _ := strings.Cut(r.NameWithOwner, "/")
+		fmt.Fprintf(&b, "  r%d: repository(owner: %s, name: %s) {\n", i, quote(owner), quote(name))
+		fmt.Fprintf(&b, "    object(expression: %s) { %s }\n", quote(r.oid()+":.github/workflows"), workflowsTree)
+		b.WriteString("  }\n")
+	}
+	b.WriteString("}\n")
+	return b.String()
 }
-` + repoFields
 
 const repoQuery = `query($owner: String!, $name: String!) {
   ` + rateLimitField + `
@@ -123,6 +145,14 @@ type repoNode struct {
 			Object *blob  `json:"object"`
 		} `json:"entries"`
 	} `json:"object"`
+}
+
+// oid returns the default branch commit, or "" for an empty repository.
+func (n repoNode) oid() string {
+	if n.DefaultBranchRef == nil {
+		return ""
+	}
+	return n.DefaultBranchRef.Target.OID
 }
 
 type object struct {
