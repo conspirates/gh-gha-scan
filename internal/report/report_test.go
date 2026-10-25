@@ -50,8 +50,24 @@ func TestIncompleteRepository(t *testing.T) {
 	if want := "o/app\tNone (incomplete, see warnings)\t\n"; table.String() != want {
 		t.Errorf("Table() = %q, want %q", table.String(), want)
 	}
-	Summary(&summary, repos, []string{"o/app: stopped at --depth 10; refs inside x were not checked"})
+	Summary(&summary, repos, Skipped{}, []string{"o/app: stopped at --depth 10; refs inside x were not checked"})
 	if !bytes.Contains(summary.Bytes(), []byte("1 repositories were not fully checked")) {
 		t.Errorf("Summary() = %q", summary.String())
+	}
+}
+
+func TestSummaryShowsSkipped(t *testing.T) {
+	var b bytes.Buffer
+	Summary(&b, nil, Skipped{
+		Forks:     3,
+		Workflows: []SkippedWorkflow{{Repository: "o/fork", File: ".github/workflows/ci.yml", State: "disabled_fork"}},
+	}, nil)
+	for _, want := range []string{
+		"Skipped 3 forks (use --include-forks).",
+		"Skipped 1 workflows in forks that GitHub won't run:\n  o/fork: .github/workflows/ci.yml (disabled_fork)",
+	} {
+		if !bytes.Contains(b.Bytes(), []byte(want)) {
+			t.Errorf("Summary() is missing %q:\n%s", want, b.String())
+		}
 	}
 }

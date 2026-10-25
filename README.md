@@ -34,7 +34,7 @@ gh gha-scan --owner my-org --json | jq '.repositories[] | select(.items != [])'
 | `--json` | Output every repository with its items, fixes and the underlying findings, plus warnings and API stats, as JSON |
 | `--exit-code` | Set the exit status from the result, for CI (see [Exit status](#exit-status)) |
 | `--depth N` | Follow transitive refs at most N levels deep (default 10) |
-| `--include-archived`, `--include-forks` | Include archived repositories or forks with `--owner` (excluded by default) |
+| `--include-archived`, `--include-forks` | Include archived repositories or forks with `--owner` (excluded by default; the summary says how many forks were skipped) |
 | `--no-cache` | Don't use the on-disk cache |
 
 ## Output
@@ -78,6 +78,7 @@ Without `--exit-code`, a scan that runs exits 0 whatever it finds.
 - `$/path` refs (same repository, at the running commit) aren't findings either. They're read from the repository of the file they're written in: the scanned repository itself, or the dependency at the ref it was called with. A `$/` ref with `@ref` is invalid.
 - `docker://` images are ignored, since the policy covers actions only.
 - Only top-level `.github/workflows/*.yml` and `*.yaml` files are scanned, as GitHub only runs those.
+- With `--include-forks`, a fork's workflow files are only scanned if GitHub would run them: their state must be `active`. Files in a fork where Actions was never enabled aren't registered at all and are skipped too. Skipped files are listed with their state, e.g. `disabled_fork` or `not_registered`. This costs one REST call per fork.
 
 ## Cost
 

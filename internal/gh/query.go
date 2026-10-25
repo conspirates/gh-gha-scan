@@ -21,6 +21,7 @@ const blobFields = "... on Blob { text isTruncated isBinary }"
 // workflow files, so listing repos and reading workflows is one query.
 const repoFields = `fragment repoFields on Repository {
   nameWithOwner
+  isFork
   defaultBranchRef { target { oid } }
   object(expression: "HEAD:.github/workflows") {
     ... on Tree { entries { name type object { ` + blobFields + ` } } }
@@ -30,6 +31,7 @@ const repoFields = `fragment repoFields on Repository {
 const ownerReposQuery = `query($login: String!, $first: Int!, $after: String, $archived: Boolean, $fork: Boolean) {
   ` + rateLimitField + `
   repositoryOwner(login: $login) {
+    forks: repositories(isFork: true, isArchived: $archived, ownerAffiliations: [OWNER]) { totalCount }
     repositories(first: $first, after: $after, isArchived: $archived, isFork: $fork, ownerAffiliations: [OWNER], orderBy: {field: NAME, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
       nodes { ...repoFields }
@@ -108,6 +110,7 @@ type blob struct {
 
 type repoNode struct {
 	NameWithOwner    string `json:"nameWithOwner"`
+	IsFork           bool   `json:"isFork"`
 	DefaultBranchRef *struct {
 		Target struct {
 			OID string `json:"oid"`

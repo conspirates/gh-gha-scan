@@ -44,6 +44,7 @@ type Client struct {
 // Repo is a repository with its top-level workflow files.
 type Repo struct {
 	NameWithOwner string
+	IsFork        bool
 	HeadOID       string
 	Files         []scan.File
 }
@@ -165,8 +166,9 @@ func notFound(err error) (map[string]string, error) {
 }
 
 // OwnerRepos lists the repositories of an organization or user, with their
-// workflow files.
-func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, includeForks bool) ([]Repo, error) {
+// workflow files. skippedForks counts the forks left out when includeForks
+// is false.
+func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, includeForks bool) (repos []Repo, skippedForks int, err error) {
 	vars := map[string]any{"login": login}
 	if !includeArchived {
 		vars["archived"] = false
@@ -177,11 +179,13 @@ func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, 
 	// Some repositories have huge workflow files, so start small and shrink
 	// the page further if GitHub times out.
 	first := 25
-	var repos []Repo
 	for {
 		vars["first"] = first
 		var resp struct {
 			RepositoryOwner *struct {
+				Forks struct {
+					TotalCount int `json:"totalCount"`
+				} `json:"forks"`
 				Repositories struct {
 					PageInfo struct {
 						HasNextPage bool   `json:"hasNextPage"`
@@ -197,21 +201,24 @@ func (c *Client) OwnerRepos(ctx context.Context, login string, includeArchived, 
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if resp.RepositoryOwner == nil {
-			return nil, fmt.Errorf("no organization or user named %q", login)
+			return nil, 0, fmt.Errorf("no organization or user named %q", login)
+		}
+		if !includeForks {
+			skippedForks = resp.RepositoryOwner.Forks.TotalCount
 		}
 		for _, n := range resp.RepositoryOwner.Repositories.Nodes {
 			r, err := c.repo(ctx, n)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			repos = append(repos, r)
 		}
 		page := resp.RepositoryOwner.Repositories.PageInfo
 		if !page.HasNextPage {
-			return repos, nil
+			return repos, skippedForks, nil
 		}
 		vars["after"] = page.EndCursor
 	}
@@ -233,7 +240,7 @@ func (c *Client) Repo(ctx context.Context, owner, name string) (Repo, error) {
 }
 
 func (c *Client) repo(ctx context.Context, n repoNode) (Repo, error) {
-	r := Repo{NameWithOwner: n.NameWithOwner}
+	r := Repo{NameWithOwner: n.NameWithOwner, IsFork: n.IsFork}
 	if n.DefaultBranchRef != nil {
 		r.HeadOID = n.DefaultBranchRef.Target.OID
 	}
@@ -271,6 +278,33 @@ func (c *Client) text(ctx context.Context, repo, commit, p string, b *blob) (str
 		return "", fmt.Errorf("read %s/%s: %w", repo, p, err)
 	}
 	return string(data), nil
+}
+
+// WorkflowStates returns the state of each workflow GitHub has registered in
+// repo, keyed by path: "active", "disabled_fork", "disabled_manually" and so
+// on. Workflow files GitHub has never registered, e.g. in a fork where
+// Actions was never enabled, have no entry.
+func (c *Client) WorkflowStates(ctx context.Context, repo string) (map[string]string, error) {
+	out := map[string]string{}
+	for page := 1; ; page++ {
+		var resp struct {
+			TotalCount int `json:"total_count"`
+			Workflows  []struct {
+				Path  string `json:"path"`
+				State string `json:"state"`
+			} `json:"workflows"`
+		}
+		endpoint := fmt.Sprintf("repos/%s/actions/workflows?per_page=100&page=%d", repo, page)
+		if err := c.rest.DoWithContext(ctx, http.MethodGet, endpoint, nil, &resp); err != nil {
+			return nil, fmt.Errorf("list workflows of %s: %w", repo, err)
+		}
+		for _, w := range resp.Workflows {
+			out[w.Path] = w.State
+		}
+		if len(resp.Workflows) == 0 || page*100 >= resp.TotalCount {
+			return out, nil
+		}
+	}
 }
 
 // Tags implements fix.TagLister with batched GraphQL queries. Repositories

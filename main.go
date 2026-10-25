@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/cli/go-gh/v2/pkg/term"
@@ -105,12 +106,16 @@ func run(ctx context.Context, opts *options, args []string) error {
 	}
 
 	var roots []scan.Root
+	var skipped report.Skipped
+	var warnings []string
 	switch {
 	case opts.owner != "":
-		repos, err := client.OwnerRepos(ctx, opts.owner, opts.includeArchived, opts.includeForks)
+		repos, skippedForks, err := client.OwnerRepos(ctx, opts.owner, opts.includeArchived, opts.includeForks)
 		if err != nil {
 			return err
 		}
+		skipped.Forks = skippedForks
+		skipped.Workflows, warnings = dropNotRunnable(ctx, client, repos)
 		for _, r := range repos {
 			roots = append(roots, remoteRoot(r))
 		}
@@ -156,11 +161,11 @@ func run(ctx context.Context, opts *options, args []string) error {
 	if err != nil {
 		return err
 	}
-	res.Warnings = append(res.Warnings, planner.Warnings...)
+	res.Warnings = append(append(warnings, res.Warnings...), planner.Warnings...)
 
 	stats := client.Stats()
 	if opts.json {
-		if err := report.JSON(os.Stdout, repos, res.Warnings, stats); err != nil {
+		if err := report.JSON(os.Stdout, repos, skipped, res.Warnings, stats); err != nil {
 			return err
 		}
 	} else {
@@ -169,7 +174,7 @@ func run(ctx context.Context, opts *options, args []string) error {
 		if err := report.Table(t.Out(), repos, t.IsTerminalOutput(), width); err != nil {
 			return err
 		}
-		report.Summary(t.ErrOut(), repos, res.Warnings)
+		report.Summary(t.ErrOut(), repos, skipped, res.Warnings)
 		msg := "\nAPI: no GraphQL queries"
 		if stats.Queries > 0 {
 			msg = fmt.Sprintf("\nAPI: %d GraphQL queries, %d points used, %d remaining", stats.Queries, stats.Cost, stats.Remaining)
@@ -200,6 +205,61 @@ func status(repos []fix.Repo) error {
 		return exitStatus(exitIncomplete)
 	}
 	return nil
+}
+
+// workflowStater is implemented by *gh.Client.
+type workflowStater interface {
+	WorkflowStates(ctx context.Context, repo string) (map[string]string, error)
+}
+
+// dropNotRunnable removes the workflow files of forks that GitHub won't run,
+// since the SHA pinning policy only affects workflows that run. Only active
+// workflows are kept. A fork where Actions was never enabled has no
+// registered workflows at all. When a fork's states can't be read, all its
+// files are scanned, with a warning.
+func dropNotRunnable(ctx context.Context, c workflowStater, repos []gh.Repo) (skipped []report.SkippedWorkflow, warnings []string) {
+	states := make([]map[string]string, len(repos))
+	errs := make([]error, len(repos))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for i, r := range repos {
+		if !r.IsFork || len(r.Files) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			states[i], errs[i] = c.WorkflowStates(ctx, r.NameWithOwner)
+		}()
+	}
+	wg.Wait()
+
+	for i := range repos {
+		r := &repos[i]
+		if errs[i] != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: %v; scanning all its workflow files", r.NameWithOwner, errs[i]))
+			continue
+		}
+		if states[i] == nil {
+			continue
+		}
+		var kept []scan.File
+		for _, f := range r.Files {
+			state, ok := states[i][f.Path]
+			if !ok {
+				state = "not_registered"
+			}
+			if state == "active" {
+				kept = append(kept, f)
+				continue
+			}
+			skipped = append(skipped, report.SkippedWorkflow{Repository: r.NameWithOwner, File: f.Path, State: state})
+		}
+		r.Files = kept
+	}
+	return skipped, warnings
 }
 
 func remoteRoot(r gh.Repo) scan.Root {
