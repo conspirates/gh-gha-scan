@@ -9,7 +9,12 @@ Scans for insecure use of GitHub Actions.
 gh extension install conspirates/gh-gha-scan
 ```
 
-Each release includes prebuilt binaries with signed build provenance. To check one, run `gh attestation verify <binary> -R conspirates/gh-gha-scan`.
+Each release includes prebuilt binaries with signed build provenance. Verify the downloaded release asset, not the installed binary: on macOS, `gh extension install` re-signs the binary, so its hash no longer matches and verification fails with HTTP 404.
+
+```sh
+gh release download v0.3.0 -R conspirates/gh-gha-scan -p darwin-arm64   # or your platform
+gh attestation verify darwin-arm64 -R conspirates/gh-gha-scan
+```
 
 To build from source instead, you need Go 1.26.10 or later, which Go downloads automatically when the toolchain setting allows it.
 
