@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +25,9 @@ type Stats struct {
 	Cost      int    `json:"cost"`
 	Remaining int    `json:"remaining"`
 	ResetAt   string `json:"reset_at,omitempty"`
-	// Retries counts queries retried after a server error or a secondary
-	// rate limit, and RetryWait is the total time spent waiting for them.
+	// Retries counts requests retried after a transport failure, a server
+	// error or a rate limit, and RetryWait is the total time spent waiting
+	// for them.
 	Retries          int           `json:"retries"`
 	RetryWait        time.Duration `json:"-"`
 	RetryWaitSeconds float64       `json:"retry_wait_seconds"`
@@ -44,6 +44,7 @@ type Client struct {
 	// Roots, if set, caches the workflow files of listed repositories.
 	Roots RootCache
 
+	retry *retryTransport
 	mu    sync.Mutex
 	stats Stats
 	known bool // whether stats.Remaining has been observed
@@ -59,17 +60,31 @@ type Repo struct {
 
 // New returns a client authenticated the way gh is.
 func New() (*Client, error) {
-	gql, err := api.DefaultGraphQLClient()
-	if err != nil {
-		return nil, err
-	}
-	rest, err := api.NewRESTClient(api.ClientOptions{
-		Headers: map[string]string{"Accept": "application/vnd.github.raw+json"},
+	return newClient(http.DefaultTransport, api.ClientOptions{})
+}
+
+// newClient returns a client whose requests go through base, with retries.
+// Empty opts fields default the way gh's do.
+func newClient(base http.RoundTripper, opts api.ClientOptions) (*Client, error) {
+	c := &Client{Concurrency: 4}
+	c.retry = newRetryTransport(base, func(wait time.Duration) {
+		c.mu.Lock()
+		c.stats.Retries++
+		c.stats.RetryWait += wait
+		c.mu.Unlock()
 	})
+	opts.Transport = c.retry
+	gql, err := api.NewGraphQLClient(opts)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{gql: gql, rest: rest, Concurrency: 4}, nil
+	opts.Headers = map[string]string{"Accept": "application/vnd.github.raw+json"}
+	rest, err := api.NewRESTClient(opts)
+	if err != nil {
+		return nil, err
+	}
+	c.gql, c.rest = gql, rest
+	return c, nil
 }
 
 // Stats returns API usage so far.
@@ -85,8 +100,8 @@ func (c *Client) Stats() Stats {
 // running into the hard limit.
 const minRemaining = 20
 
-// do runs a query, retrying transient server errors and tracking rate limits.
-// GraphQL errors are returned together with the partial data in out.
+// do runs a query and tracks the rate limit. GraphQL errors are returned
+// together with the partial data in out.
 func (c *Client) do(ctx context.Context, query string, vars map[string]any, out any) error {
 	c.mu.Lock()
 	if c.known && c.stats.Remaining < minRemaining {
@@ -96,24 +111,7 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	c.mu.Unlock()
 
 	var data map[string]json.RawMessage
-	var err error
-	for attempt := 0; ; attempt++ {
-		data = nil
-		err = c.gql.DoWithContext(ctx, query, vars, &data)
-		wait, retry := retryAfter(err, attempt)
-		if !retry {
-			break
-		}
-		c.mu.Lock()
-		c.stats.Retries++
-		c.stats.RetryWait += wait
-		c.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
-	}
+	err := c.gql.DoWithContext(ctx, query, vars, &data)
 
 	if raw, ok := data["rateLimit"]; ok {
 		var rl rateLimit
@@ -134,25 +132,6 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 		}
 	}
 	return err
-}
-
-// retryAfter decides whether err is worth retrying and how long to wait.
-func retryAfter(err error, attempt int) (time.Duration, bool) {
-	var he *api.HTTPError
-	if !errors.As(err, &he) || attempt >= 3 {
-		return 0, false
-	}
-	switch {
-	case he.StatusCode >= 500:
-		return time.Duration(1<<attempt) * time.Second, true
-	case he.StatusCode == http.StatusForbidden || he.StatusCode == http.StatusTooManyRequests:
-		// Secondary rate limits say how long to wait; primary ones don't
-		// recover within a run, so only wait for short Retry-After values.
-		if s, err := strconv.Atoi(he.Headers.Get("Retry-After")); err == nil && s <= 60 {
-			return time.Duration(s) * time.Second, true
-		}
-	}
-	return 0, false
 }
 
 func isServerError(err error) bool {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cli/go-gh/v2/pkg/api"
 
@@ -28,19 +29,16 @@ func (h handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// testClient returns a client whose GraphQL and REST requests go to h.
+// testClient returns a client whose GraphQL and REST requests go to h,
+// through the retry transport without real waits.
 func testClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Helper()
-	opts := api.ClientOptions{Host: "github.com", AuthToken: "test", Transport: handlerTransport(h)}
-	gql, err := api.NewGraphQLClient(opts)
+	c, err := newClient(handlerTransport(h), api.ClientOptions{Host: "github.com", AuthToken: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	rest, err := api.NewRESTClient(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &Client{gql: gql, rest: rest, Concurrency: 4}
+	c.retry.sleep = func(context.Context, time.Duration) error { return nil }
+	return c
 }
 
 func TestRetriesAreCounted(t *testing.T) {
