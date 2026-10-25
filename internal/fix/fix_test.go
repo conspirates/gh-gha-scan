@@ -211,3 +211,43 @@ func TestUnreadableReleaseIsNotSuggested(t *testing.T) {
 		})
 	}
 }
+
+func TestThirdPartyInsideSameOwnerDependencyIsUpgradedThere(t *testing.T) {
+	// me/shared calls ext/tp v1, which uses z/z unpinned; ext/tp v2 is clean.
+	// The fix is in me/shared's file, not in ext/tp's.
+	f := fakeFetcher{
+		"me/shared/@" + shaV1: {"ext/tp@" + shaV1},
+		"ext/tp/@" + shaV1:    {"z/z@v1"},
+		"ext/tp/@" + shaV2:    {},
+		"z/z/@v1":             {},
+	}
+	tags := fakeTags{"ext/tp": {{Name: "v2.0.0", SHA: shaV2}}}
+	it := only(t, plan(t, f, tags, scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("me/shared@" + shaV1)}}))
+	want := "Upgrade ext/tp@1111111 in me/shared/action.yml@" + shaV1 + ":4 to ext/tp@" + shaV2 + " # v2.0.0, then update this reference"
+	if it.FixKind != PinUpstream || it.Fix != want {
+		t.Errorf("got %s: %q\nwant %q", it.FixKind, it.Fix, want)
+	}
+}
+
+func TestThirdPartyInsideSameOwnerDependencyWithNoFix(t *testing.T) {
+	f := fakeFetcher{
+		"me/shared/@" + shaV1: {"ext/tp@" + shaV1, "actions/setup-go@v5"},
+		"ext/tp/@" + shaV1:    {"z/z@v1"},
+		"z/z/@v1":             {},
+	}
+	it := only(t, plan(t, f, nil, scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("me/shared@" + shaV1)}}))
+	if it.FixKind != None {
+		t.Errorf("FixKind = %s, want none", it.FixKind)
+	}
+	for _, want := range []string{
+		"Pin actions/setup-go@v5 in me/shared/action.yml@" + shaV1 + ":5",
+		"ext/tp@1111111 in me/shared/action.yml@" + shaV1 + ":4: No fix upstream yet: ext/tp has no releases and uses z/z@v1 unpinned",
+	} {
+		if !strings.Contains(it.Fix, want) {
+			t.Errorf("Fix = %q\nmissing %q", it.Fix, want)
+		}
+	}
+	if strings.Contains(it.Fix, "in ext/tp/") {
+		t.Errorf("Fix = %q suggests editing a third-party file", it.Fix)
+	}
+}

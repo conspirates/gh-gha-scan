@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -494,5 +495,102 @@ func TestUnparsableFetchedFileMarksIncomplete(t *testing.T) {
 	// The file is parsed once, but every repository that uses it is affected.
 	if !res.Incomplete["o/one"] || !res.Incomplete["o/two"] || len(res.Warnings) != 1 {
 		t.Errorf("incomplete = %v, warnings = %v; want both incomplete with one warning", res.Incomplete, res.Warnings)
+	}
+}
+
+func TestSharedDependencyIsWalkedOnce(t *testing.T) {
+	// A chain of diamonds: each level reaches the next through two paths,
+	// which used to double the work and the findings at every level.
+	actions := map[string][]string{}
+	const levels = 12
+	for i := 0; i < levels; i++ {
+		next := fmt.Sprintf("d/l%d@%s", i+1, pinned)
+		actions[fmt.Sprintf("d/l%d/@%s", i, pinned)] = []string{fmt.Sprintf("d/a%d@%s", i, pinned), fmt.Sprintf("d/b%d@%s", i, pinned)}
+		actions[fmt.Sprintf("d/a%d/@%s", i, pinned)] = []string{next}
+		actions[fmt.Sprintf("d/b%d/@%s", i, pinned)] = []string{next}
+	}
+	actions[fmt.Sprintf("d/l%d/@%s", levels, pinned)] = []string{"x/x@v1"}
+	actions["x/x/@v1"] = []string{}
+	s := &Scanner{Fetcher: &fakeFetcher{actions: actions}, Depth: 100}
+	res, err := s.Scan(context.Background(), []Root{{Name: "o/r", Files: []File{workflowFile("d/l0@" + pinned)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Findings) != 1 || res.Findings[0].Uses != "x/x@v1" {
+		t.Errorf("got %d findings, want x/x@v1 once: %+v", len(res.Findings), briefs(res.Findings)[:min(len(res.Findings), 3)])
+	}
+	if res.Incomplete["o/r"] || len(res.Warnings) != 0 {
+		t.Errorf("incomplete = %v, warnings = %v", res.Incomplete, res.Warnings)
+	}
+}
+
+func TestSharedDependencyIsReportedUnderEachDirectRef(t *testing.T) {
+	// Two direct refs that share a dependency each need their own fix.
+	f := &fakeFetcher{actions: map[string][]string{
+		"a/a/@v1":        {"s/s@" + pinned},
+		"b/b/@v1":        {"s/s@" + pinned},
+		"s/s/@" + pinned: {"x/x@v1"},
+		"x/x/@v1":        {},
+	}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{Name: "o/r", Files: []File{workflowFile("a/a@v1", "b/b@v1")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directs := map[string]bool{}
+	for _, f := range res.Findings {
+		if f.Uses == "x/x@v1" {
+			directs[f.Direct.Uses] = true
+		}
+	}
+	if !directs["a/a@v1"] || !directs["b/b@v1"] {
+		t.Errorf("x/x@v1 reported under %v, want both a/a@v1 and b/b@v1", directs)
+	}
+}
+
+func TestNestedInvalidUsesWarnsAtItsOwnLocation(t *testing.T) {
+	f := &fakeFetcher{actions: map[string][]string{"ext/a/@" + pinned: {"checkout@v4"}}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{Name: "o/r", Files: []File{workflowFile("ext/a@" + pinned)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "o/r: ext/a/action.yml@" + pinned + `:4: cannot parse uses "checkout@v4"`
+	if len(res.Warnings) != 1 || res.Warnings[0] != want {
+		t.Errorf("warnings = %q, want %q", res.Warnings, want)
+	}
+}
+
+func TestSourceOwnerAndBoundary(t *testing.T) {
+	// me/lib is a same-owner composite: it uses y/y unpinned itself, and
+	// the pinned third-party ext/tp, which uses z/z unpinned.
+	f := &fakeFetcher{actions: map[string][]string{
+		"me/lib/@" + pinned: {"y/y@v1", "ext/tp@" + pinned},
+		"ext/tp/@" + pinned: {"z/z@v1"},
+		"y/y/@v1":           {},
+		"z/z/@v1":           {},
+	}}
+	s := &Scanner{Fetcher: f, Depth: 10}
+	res, err := s.Scan(context.Background(), []Root{{Name: "me/app", Owner: "me", Files: []File{workflowFile("me/lib@" + pinned)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Findings) != 2 {
+		t.Fatalf("got %+v", briefs(res.Findings))
+	}
+	y, z := res.Findings[0], res.Findings[1]
+	if y.Uses != "y/y@v1" || y.SourceOwner != "me" || y.SourceExternal || !y.External {
+		t.Errorf("y: uses %q, source owner %q, source external %v, external %v; want me, false, true", y.Uses, y.SourceOwner, y.SourceExternal, y.External)
+	}
+	// y/y is in a file me controls, so it is its own boundary.
+	if y.Boundary.Uses != "y/y@v1" {
+		t.Errorf("y: boundary = %+v, want y/y@v1 itself", y.Boundary)
+	}
+	if z.Uses != "z/z@v1" || z.SourceOwner != "ext" || !z.SourceExternal {
+		t.Errorf("z: uses %q, source owner %q, source external %v; want ext, true", z.Uses, z.SourceOwner, z.SourceExternal)
+	}
+	wantB := Direct{Uses: "ext/tp@" + pinned, File: "me/lib/action.yml@" + pinned, Line: 5}
+	if z.Boundary != wantB || z.Direct.Uses != "me/lib@"+pinned {
+		t.Errorf("z: boundary = %+v, want %+v; direct = %+v", z.Boundary, wantB, z.Direct)
 	}
 }

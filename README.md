@@ -54,11 +54,14 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 |---|---|
 | Pin to `<action>@<sha> # <version>` | The ref itself is unpinned and everything it uses is pinned. The SHA is the commit the current version points at, so behavior doesn't change. |
 | Upgrade to `<action>@<sha> # <version>` | The dependency uses unpinned refs, and its newest release (by version tag) is fully pinned. Marked when the major version changes. |
-| Pin `<ref>` in `<file>`, then update this reference | The dependency belongs to the same owner, so the refs inside it can be pinned directly. |
+| Pin `<ref>` in `<file>`, then update this reference | The dependency belongs to the same owner, so the refs inside it can be pinned directly. When the unpinned ref is inside a third-party action that the dependency calls, the step is instead to upgrade that action in the dependency's file, or there's no fix upstream yet. |
 | No fix upstream yet | Even the newest release still uses unpinned refs: fork it, replace it, or ask upstream to pin. |
 | No verified fix | Part of the newest release couldn't be read, so it isn't known to be fully pinned. The warnings say what failed. |
 
-A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read, couldn't be parsed or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it.
+A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read, couldn't be parsed or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it. For each finding:
+- `external` says whether the unpinned action belongs to another owner;
+- `source_owner` and `source_external` say who owns the file it's written in;
+- `boundary` is the reference to change to fix it, in a file the repository's owner controls.
 
 ## Exit status
 

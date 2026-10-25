@@ -33,8 +33,9 @@ const (
 	Pin Kind = "pin"
 	// Upgrade: move to a release whose own references are all pinned.
 	Upgrade Kind = "upgrade"
-	// PinUpstream: the dependency belongs to the same owner, so pin the
-	// references inside it.
+	// PinUpstream: the dependency belongs to the same owner, so fix the
+	// references inside it: pin those in the owner's files, and upgrade the
+	// third-party actions those files call when the problem is inside them.
 	PinUpstream Kind = "pin-upstream"
 	// None: no release of the dependency is fully pinned yet.
 	None Kind = "none"
@@ -111,7 +112,7 @@ func (p *Planner) Plan(ctx context.Context, repos []scan.Root, res scan.Result) 
 				Line:     g.direct.Line,
 				Findings: g.findings,
 			}
-			describe(&it, root, g, upgrades[upgradeKey(g.ref)])
+			describe(&it, root, g, upgrades)
 			r.Items = append(r.Items, it)
 		}
 		sort.SliceStable(r.Items, func(i, j int) bool { return r.Items[i].Action < r.Items[j].Action })
@@ -123,16 +124,22 @@ func (p *Planner) Plan(ctx context.Context, repos []scan.Root, res scan.Result) 
 // display shows a pinned SHA shortened, with its version comment, and names
 // the local action a reference is written in.
 func display(d scan.Direct) string {
-	r := ref.Parse(d.Uses)
-	s := d.Uses
-	if r.IsPinned() {
-		s = r.Name() + "@" + r.Ref[:7]
-		if d.Comment != "" {
-			s += " (" + d.Comment + ")"
-		}
-	}
+	s := short(d)
 	if !strings.HasPrefix(d.File, ".github/workflows/") {
 		s += " (in " + d.File + ")"
+	}
+	return s
+}
+
+// short shows a pinned SHA shortened, with its version comment.
+func short(d scan.Direct) string {
+	r := ref.Parse(d.Uses)
+	if !r.IsPinned() {
+		return d.Uses
+	}
+	s := r.Name() + "@" + r.Ref[:7]
+	if d.Comment != "" {
+		s += " (" + d.Comment + ")"
 	}
 	return s
 }
@@ -161,8 +168,9 @@ type candidate struct {
 func upgradeKey(r ref.Ref) string { return strings.ToLower(r.Owner + "/" + r.Repo + "/" + r.Path) }
 
 // upgrades checks the newest release of each external dependency that has
-// unpinned references inside it. Tags are listed in one batch, and all
-// candidates are scanned together.
+// unpinned references inside it: one a repository calls directly, or one
+// called from a file in a same-owner dependency. Tags are listed in one
+// batch, and all candidates are scanned together.
 func (p *Planner) upgrades(ctx context.Context, roots []scan.Root, index map[string]*group) (map[string]*candidate, error) {
 	owners := map[string]string{}
 	for _, r := range roots {
@@ -171,12 +179,18 @@ func (p *Planner) upgrades(ctx context.Context, roots []scan.Root, index map[str
 	need := map[string]ref.Ref{}
 	repoSet := map[string]bool{}
 	for k, g := range index {
-		repo := k[:strings.IndexByte(k, 0)]
-		if len(transitive(g.findings)) == 0 || sameOwner(owners[repo], g.ref) {
-			continue
+		owner := owners[k[:strings.IndexByte(k, 0)]]
+		for _, f := range transitive(g.findings) {
+			r := g.ref
+			if sameOwner(owner, g.ref) {
+				if !f.SourceExternal {
+					continue
+				}
+				r = ref.Parse(f.Boundary.Uses)
+			}
+			need[upgradeKey(r)] = r
+			repoSet[strings.ToLower(r.Owner+"/"+r.Repo)] = true
 		}
-		need[upgradeKey(g.ref)] = g.ref
-		repoSet[strings.ToLower(g.ref.Owner+"/"+g.ref.Repo)] = true
 	}
 	if len(need) == 0 {
 		return nil, nil
@@ -245,8 +259,9 @@ func sameOwner(owner string, r ref.Ref) bool {
 	return owner != "" && strings.EqualFold(owner, r.Owner)
 }
 
-func describe(it *Item, root scan.Root, g *group, c *candidate) {
+func describe(it *Item, root scan.Root, g *group, upgrades map[string]*candidate) {
 	nested := transitive(g.findings)
+	c := upgrades[upgradeKey(g.ref)]
 	switch {
 	case len(nested) == 0:
 		it.FixKind = Pin
@@ -259,17 +274,7 @@ func describe(it *Item, root scan.Root, g *group, c *candidate) {
 		it.Fix = "Pin to " + it.Replacement
 
 	case sameOwner(root.Owner, g.ref):
-		it.FixKind = PinUpstream
-		var locs []string
-		seen := map[string]bool{}
-		for _, f := range nested {
-			l := f.Uses + " in " + f.Source
-			if !seen[l] {
-				seen[l] = true
-				locs = append(locs, l)
-			}
-		}
-		it.Fix = "Pin " + strings.Join(locs, "; ") + ", then update this reference"
+		describeUpstream(it, nested, upgrades)
 
 	case c != nil && c.clean:
 		it.FixKind = Upgrade
@@ -281,15 +286,53 @@ func describe(it *Item, root scan.Root, g *group, c *candidate) {
 
 	default:
 		it.FixKind = None
-		switch {
-		case c != nil && c.blocker == "" && c.unverified:
-			it.Fix = fmt.Sprintf("No verified fix: could not read all of latest release %s to check it (see warnings)", c.tag.Name)
-		case c == nil:
-			it.Fix = fmt.Sprintf("No fix upstream yet: %s has no releases and uses %s unpinned; fork it or ask upstream to pin", g.ref.Name(), nested[0].Uses)
-		default:
-			it.Fix = fmt.Sprintf("No fix upstream yet: latest release %s still uses %s; fork it or ask upstream to pin", c.tag.Name, c.blocker)
+		it.Fix = noFix(g.ref, c, nested[0].Uses)
+	}
+}
+
+// describeUpstream suggests fixes inside a same-owner dependency. A nested
+// reference in a file the owner controls is pinned there. One in a
+// third-party file can only be fixed through the reference to that third
+// party in the owner's file: upgrade it, or there is no fix yet.
+func describeUpstream(it *Item, nested []scan.Finding, upgrades map[string]*candidate) {
+	it.FixKind = PinUpstream
+	var steps []string
+	seen := map[string]bool{}
+	for _, f := range nested {
+		var s string
+		if !f.SourceExternal {
+			s = "Pin " + f.Uses + " in " + f.Source
+		} else {
+			b := ref.Parse(f.Boundary.Uses)
+			at := fmt.Sprintf("%s in %s:%d", short(f.Boundary), f.Boundary.File, f.Boundary.Line)
+			if c := upgrades[upgradeKey(b)]; c != nil && c.clean {
+				s = fmt.Sprintf("Upgrade %s to %s@%s # %s", at, b.Name(), c.tag.SHA, c.tag.Name)
+			} else {
+				it.FixKind = None
+				s = at + ": " + noFix(b, c, f.Uses)
+			}
+		}
+		if !seen[s] {
+			seen[s] = true
+			steps = append(steps, s)
 		}
 	}
+	it.Fix = strings.Join(steps, "; ")
+	if it.FixKind == PinUpstream {
+		it.Fix += ", then update this reference"
+	}
+}
+
+// noFix explains why r has no fix: c is its newest release, or nil when it
+// has none, and uses is an unpinned reference inside it.
+func noFix(r ref.Ref, c *candidate, uses string) string {
+	switch {
+	case c != nil && c.blocker == "" && c.unverified:
+		return fmt.Sprintf("No verified fix: could not read all of latest release %s to check it (see warnings)", c.tag.Name)
+	case c == nil:
+		return fmt.Sprintf("No fix upstream yet: %s has no releases and uses %s unpinned; fork it or ask upstream to pin", r.Name(), uses)
+	}
+	return fmt.Sprintf("No fix upstream yet: latest release %s still uses %s; fork it or ask upstream to pin", c.tag.Name, c.blocker)
 }
 
 // current returns the version in use: the ref itself, or the comment next to

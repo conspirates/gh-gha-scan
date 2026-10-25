@@ -64,9 +64,14 @@ type Finding struct {
 	File string `json:"file"`
 	Line int    `json:"line"`
 	// Uses is the unpinned reference.
-	Uses     string `json:"uses"`
-	Kind     string `json:"kind"`
-	External bool   `json:"external"`
+	Uses string `json:"uses"`
+	Kind string `json:"kind"`
+	// External means Uses belongs to another owner than Repo.
+	External bool `json:"external"`
+	// SourceOwner owns the file Uses is written in, and SourceExternal means
+	// that is another owner than Repo's, so Repo's owner can't edit it.
+	SourceOwner    string `json:"source_owner"`
+	SourceExternal bool   `json:"source_external"`
 	// Via lists the references between File and Uses, outermost first.
 	Via []string `json:"via,omitempty"`
 	// Source locates Uses when it is not in File itself.
@@ -75,10 +80,16 @@ type Finding struct {
 	// Direct is the action or reusable workflow that Repo itself calls and
 	// that leads to Uses. It equals Uses when Uses is not transitive.
 	Direct Direct `json:"direct"`
+	// Boundary is the reference nearest to Uses, or Uses itself, that is
+	// written in a file Repo's owner controls: the one to change to fix
+	// Uses. It is Direct unless the chain passes through a same-owner
+	// dependency.
+	Boundary Direct `json:"boundary"`
 }
 
-// Direct is a reference written in the scanned repository: in a workflow, or
-// in one of the repository's own local actions.
+// Direct is a reference and where it is written. As Finding.Direct, that is
+// in the scanned repository: in a workflow, or in one of the repository's own
+// local actions.
 type Direct struct {
 	Uses string `json:"uses"`
 	// Comment is the trailing comment, usually the version of a pinned SHA.
@@ -202,7 +213,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 		root := &roots[i]
 		for j, f := range root.Files {
 			for _, u := range rootUses[i][j] {
-				sc.walk(&res, root, f.Path, u, u, nil, nil, 1, map[string]bool{}, nil)
+				sc.walk(&res, root, f.Path, u)
 			}
 		}
 	}
@@ -344,75 +355,127 @@ func (sc *scanner) addNode(key string, n *node, data []byte) {
 	sc.nodes[key] = n
 }
 
-// walk reports u if it is unpinned and descends into what it references.
-// start is the use in the root file where the chain began, in the node that
-// u is written in, or nil when u is in the root file. direct is the first
-// remote reference on the chain, or nil while the chain has only passed
-// through local actions.
-func (sc *scanner) walk(res *Result, root *Root, file string, start, u workflow.Use, in *node, via []string, depth int, onPath map[string]bool, direct *Direct) {
-	src := ""
-	if in != nil {
-		src = in.loc(root)
-	}
-	r := ref.Parse(u.Value)
-	if r.Kind == ref.Invalid {
-		sc.warn("%s: %s:%d: cannot parse uses %q", root.Name, file, start.Line, u.Value)
-		res.Incomplete[root.Name] = true
-		return
-	}
-	t, ok := resolve(root, in, r)
-	if !ok {
-		return
-	}
-	if direct == nil && r.IsRemote() {
+// step is one `uses:` on the way down from a root workflow file.
+type step struct {
+	u workflow.Use
+	// in is the node u is written in, or nil for the root file.
+	in    *node
+	via   []string
+	depth int
+	// direct is the first remote reference on the chain, or nil while the
+	// chain has only passed through local actions.
+	direct *Direct
+	// boundary is the last remote reference on the chain that is written
+	// in a file the root's owner controls.
+	boundary *Direct
+}
+
+// walk reports the unpinned references reachable from start, a use in the
+// root file. It goes breadth first and expands each node once per direct
+// reference, so a dependency shared by several paths is walked and reported
+// once, at its shortest chain.
+func (sc *scanner) walk(res *Result, root *Root, file string, start workflow.Use) {
+	expanded := map[string]bool{}
+	queue := []step{{u: start, depth: 1}}
+	for len(queue) > 0 {
+		s := queue[0]
+		queue = queue[1:]
+		u, in := s.u, s.in
 		loc := file
-		if src != "" {
-			loc = src
+		if in != nil {
+			loc = in.loc(root)
 		}
-		direct = &Direct{Uses: u.Value, Comment: u.Comment, File: loc, Line: u.Line}
-	}
-	if r.IsRemote() && !r.IsPinned() {
-		f := Finding{
-			Repo: root.Name, File: file, Line: start.Line,
-			Uses: u.Value, Kind: r.Kind.String(),
-			External: root.Owner == "" || !strings.EqualFold(r.Owner, root.Owner),
-			Via:      via,
-			Direct:   *direct,
+		r := ref.Parse(u.Value)
+		if r.Kind == ref.Invalid {
+			sc.warn("%s: %s:%d: cannot parse uses %q", root.Name, loc, u.Line, u.Value)
+			res.Incomplete[root.Name] = true
+			continue
 		}
-		if src != "" {
-			f.Source = fmt.Sprintf("%s:%d", src, u.Line)
+		t, ok := resolve(root, in, r)
+		if !ok {
+			continue
 		}
-		if n := sc.nodes[t.key]; n != nil {
-			f.SuggestedSHA = n.sha
+		owned := sc.owned(root, in)
+		direct, boundary := s.direct, s.boundary
+		if r.IsRemote() {
+			here := &Direct{Uses: u.Value, Comment: u.Comment, File: loc, Line: u.Line}
+			if direct == nil {
+				direct = here
+			}
+			if owned || boundary == nil {
+				boundary = here
+			}
 		}
-		res.Findings = append(res.Findings, f)
-	}
-	n := sc.nodes[t.key]
-	if n == nil {
-		if sc.missing[t.key] {
+		if r.IsRemote() && !r.IsPinned() {
+			f := Finding{
+				Repo: root.Name, File: file, Line: start.Line,
+				Uses: u.Value, Kind: r.Kind.String(),
+				External:       root.Owner == "" || !strings.EqualFold(r.Owner, root.Owner),
+				SourceOwner:    root.Owner,
+				SourceExternal: !owned,
+				Via:            s.via,
+				Direct:         *direct,
+				Boundary:       *boundary,
+			}
+			if in != nil {
+				f.Source = fmt.Sprintf("%s:%d", loc, u.Line)
+				if in.repo != "" {
+					f.SourceOwner, _, _ = strings.Cut(in.repo, "/")
+				}
+			}
+			if n := sc.nodes[t.key]; n != nil {
+				f.SuggestedSHA = n.sha
+			}
+			res.Findings = append(res.Findings, f)
+		}
+		n := sc.nodes[t.key]
+		if n == nil {
+			if sc.missing[t.key] {
+				res.Incomplete[root.Name] = true
+			}
+			continue
+		}
+		if n.unparsed {
 			res.Incomplete[root.Name] = true
 		}
-		return
-	}
-	if n.unparsed {
-		res.Incomplete[root.Name] = true
-	}
-	if onPath[t.key] {
-		return
-	}
-	if depth >= sc.Depth {
-		if len(sc.targets(root, n, n.uses)) > 0 {
-			sc.warnOnce("%s: stopped at --depth %d; refs inside %s were not checked", root.Name, sc.Depth, n.loc(root))
-			res.Incomplete[root.Name] = true
+		// A node reached again under the same direct reference would only
+		// repeat its findings; this also ends cycles.
+		ek := t.key + "\x00" + direct.key()
+		if expanded[ek] {
+			continue
 		}
-		return
+		expanded[ek] = true
+		if s.depth >= sc.Depth {
+			if len(sc.targets(root, n, n.uses)) > 0 {
+				sc.warnOnce("%s: stopped at --depth %d; refs inside %s were not checked", root.Name, sc.Depth, n.loc(root))
+				res.Incomplete[root.Name] = true
+			}
+			continue
+		}
+		via := append(s.via[:len(s.via):len(s.via)], label(u))
+		for _, c := range n.uses {
+			queue = append(queue, step{u: c, in: n, via: via, depth: s.depth + 1, direct: direct, boundary: boundary})
+		}
 	}
-	onPath[t.key] = true
-	defer delete(onPath, t.key)
-	via = append(via[:len(via):len(via)], label(u))
-	for _, c := range n.uses {
-		sc.walk(res, root, file, start, c, n, via, depth+1, onPath, direct)
+}
+
+// owned reports whether the root's owner controls the file a node was read
+// from: a root file (in is nil), a file in the checkout, or a file in a
+// repository with the same owner.
+func (sc *scanner) owned(root *Root, in *node) bool {
+	if in == nil || in.repo == "" {
+		return true
 	}
+	owner, _, _ := strings.Cut(in.repo, "/")
+	return root.Owner != "" && strings.EqualFold(owner, root.Owner)
+}
+
+// key identifies d, or "" for a nil d.
+func (d *Direct) key() string {
+	if d == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d:%s", d.File, d.Line, d.Uses)
 }
 
 func label(u workflow.Use) string {
