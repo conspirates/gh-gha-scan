@@ -60,3 +60,35 @@ func TestExtractInvalidYAML(t *testing.T) {
 		t.Error("expected an error for invalid yaml")
 	}
 }
+
+func TestExtractParallelSteps(t *testing.T) {
+	// From the fixture in issue #2, plus a background step and a nested group.
+	data := []byte(`on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - parallel:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-node@v4
+          - parallel:
+              - uses: nested/group@v1
+      - uses: bg/step@v1
+        id: bg
+        background: true
+      - wait: bg
+`)
+	got, err := Extract(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Use{
+		{Value: "actions/checkout@v4", Line: 7},
+		{Value: "actions/setup-node@v4", Line: 8},
+		{Value: "nested/group@v1", Line: 10},
+		{Value: "bg/step@v1", Line: 11},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Extract() =\n%+v\nwant\n%+v", got, want)
+	}
+}

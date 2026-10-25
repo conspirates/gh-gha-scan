@@ -18,7 +18,8 @@ type Use struct {
 }
 
 // Extract returns every `uses:` in a workflow file (jobs.*.uses and
-// jobs.*.steps[].uses) or a composite action file (runs.steps[].uses).
+// jobs.*.steps[].uses, including steps in `parallel:` groups) or a composite
+// action file (runs.steps[].uses).
 func Extract(data []byte) ([]Use, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
@@ -49,6 +50,9 @@ func appendSteps(uses []Use, steps *yaml.Node) []Use {
 	}
 	for _, step := range steps.Content {
 		uses = appendUse(uses, get(step, "uses"))
+		// A parallel: group is a list of steps. GitHub doesn't document
+		// nesting groups, but reading them recursively costs nothing.
+		uses = appendSteps(uses, get(step, "parallel"))
 	}
 	return uses
 }
