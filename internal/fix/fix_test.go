@@ -138,7 +138,7 @@ func TestNoCleanRelease(t *testing.T) {
 	}
 	tags := fakeTags{"up/action": {{"v1.0.0", shaV1}, {"v1.1.0", shaV2}}}
 	it := only(t, plan(t, f, tags, scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("up/action@v1")}}))
-	if it.FixKind != None || !strings.Contains(it.Fix, "v1.1.0 still uses actions/setup-go@v6") {
+	if it.FixKind != None || it.Reason != NoUpstreamFix || !strings.Contains(it.Fix, "v1.1.0 still uses actions/setup-go@v6") {
 		t.Errorf("got %+v", it)
 	}
 }
@@ -198,8 +198,6 @@ func TestUnreadableReleaseIsNotSuggested(t *testing.T) {
 	tags := fakeTags{"up/action": {{"v2.0.0", shaV2}}}
 	root := scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("up/action@v1")}}
 	tests := map[string]fakeFetcher{
-		// v2.0.0 has no action.yml at that path.
-		"missing action": {"up/action/@v1": {"actions/setup-go@v5"}},
 		// v2.0.0 uses a dependency that can't be read.
 		"missing dependency": {
 			"up/action/@v1":       {"actions/setup-go@v5"},
@@ -219,7 +217,7 @@ func TestUnreadableReleaseIsNotSuggested(t *testing.T) {
 				t.Fatal(err)
 			}
 			it := only(t, repos)
-			if it.FixKind != None || !strings.Contains(it.Fix, "could not read all of latest release v2.0.0") {
+			if it.FixKind != None || it.Reason != Unverified || !strings.Contains(it.Fix, "could not read all of latest release v2.0.0") {
 				t.Errorf("got %+v", it)
 			}
 			if len(p.Warnings) == 0 || !strings.HasPrefix(p.Warnings[0], "checking upgrades: ") {
@@ -326,5 +324,30 @@ func TestSameOwnerDependencyIsPinnedOnDefaultBranch(t *testing.T) {
 		"Upgrade ext/tp@1111111 in me/shared/action.yml:6 on main to ext/tp@" + shaV2 + " # v2.0.0, then update this reference"
 	if it.FixKind != PinUpstream || it.Fix != want {
 		t.Errorf("got %s: %q\nwant %q", it.FixKind, it.Fix, want)
+	}
+}
+
+func TestPathRemovedInLatestRelease(t *testing.T) {
+	// v2.0.0 has no action.yml at that path any more.
+	f := fakeFetcher{"up/action/@v1": {"actions/setup-go@v5"}}
+	tags := fakeTags{"up/action": {{"v2.0.0", shaV2}}}
+	root := scan.Root{Name: "me/app", Owner: "me", Files: []scan.File{workflow("up/action@v1")}}
+	s := &scan.Scanner{Fetcher: f, Depth: 10, Resolve: true}
+	res, err := s.Scan(context.Background(), []scan.Root{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Planner{Scanner: s, Refs: tags}
+	repos, err := p.Plan(context.Background(), []scan.Root{root}, res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := only(t, repos)
+	want := "up/action no longer exists in v2.0.0; migrate to its replacement"
+	if it.FixKind != None || it.Reason != Removed || it.Fix != want {
+		t.Errorf("got %s/%s: %q, want none/removed: %q", it.FixKind, it.Reason, it.Fix, want)
+	}
+	if len(p.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none: the removal is the fix", p.Warnings)
 	}
 }

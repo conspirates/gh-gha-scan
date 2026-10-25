@@ -110,6 +110,9 @@ type Result struct {
 	// be read or was not followed because of the depth limit, so their
 	// findings may be missing some.
 	Incomplete map[string]bool `json:"-"`
+	// NotFound holds the keys of remote references whose repository could
+	// be read but has no such file at that ref.
+	NotFound map[string]bool `json:"-"`
 }
 
 // Scanner scans roots using Fetcher.
@@ -156,13 +159,14 @@ type scanner struct {
 	*Scanner
 	nodes    map[string]*node
 	missing  map[string]bool
+	notFound map[string]bool
 	warnings []string
 	warned   map[string]bool
 }
 
 // Scan scans roots.
 func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
-	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}, warned: map[string]bool{}}
+	sc := &scanner{Scanner: s, nodes: map[string]*node{}, missing: map[string]bool{}, notFound: map[string]bool{}, warned: map[string]bool{}}
 	res := Result{Incomplete: map[string]bool{}}
 
 	rootUses := make([][][]workflow.Use, len(roots))
@@ -218,6 +222,7 @@ func (s *Scanner) Scan(ctx context.Context, roots []Root) (Result, error) {
 		}
 	}
 	res.Warnings = sc.warnings
+	res.NotFound = sc.notFound
 	if res.Warnings == nil {
 		res.Warnings = []string{}
 	}
@@ -326,6 +331,7 @@ func (sc *scanner) load(ctx context.Context, ts []target) error {
 		case !res.Found:
 			sc.warn("%s: none of %s found", name, strings.Join(req.Paths, ", "))
 			sc.missing[k] = true
+			sc.notFound[k] = true
 		default:
 			sc.addNode(k, &node{repo: req.Owner + "/" + req.Repo, path: res.Path, at: req.Ref, sha: res.SHA}, []byte(res.Text))
 		}

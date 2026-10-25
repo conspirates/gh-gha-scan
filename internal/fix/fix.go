@@ -52,6 +52,18 @@ const (
 	None Kind = "none"
 )
 
+// Reason says why there is no fix.
+type Reason string
+
+const (
+	// Removed: the path no longer exists in the newest release.
+	Removed Reason = "removed"
+	// NoUpstreamFix: no release of the dependency is fully pinned yet.
+	NoUpstreamFix Reason = "no-upstream-fix"
+	// Unverified: part of the newest release could not be read.
+	Unverified Reason = "unverified"
+)
+
 // Item is one action a repository calls that has to change.
 type Item struct {
 	// Action is the reference as written in the repository.
@@ -60,8 +72,11 @@ type Item struct {
 	File string `json:"file"`
 	Line int    `json:"line"`
 	// Fix is a one-line suggestion; FixKind and Replacement are its parts.
-	Fix         string `json:"fix"`
-	FixKind     Kind   `json:"fix_kind"`
+	Fix     string `json:"fix"`
+	FixKind Kind   `json:"fix_kind"`
+	// Reason says why there is no fix, when FixKind is None: Removed,
+	// NoUpstreamFix or Unverified.
+	Reason      Reason `json:"reason,omitempty"`
 	Replacement string `json:"replacement,omitempty"`
 	// Findings are the unpinned references behind this item.
 	Findings []scan.Finding `json:"findings"`
@@ -175,6 +190,8 @@ type candidate struct {
 	// unverified means part of this version could not be read, so it is not
 	// known to be clean.
 	unverified bool
+	// removed means the dependency's path does not exist in this version.
+	removed bool
 	// findings are the unpinned references inside this version.
 	findings []scan.Finding
 }
@@ -304,6 +321,7 @@ func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
 	}
 
 	cands := map[string]*candidate{}
+	keys := map[string]ref.Ref{}
 	var probes []scan.Root
 	for _, w := range ws {
 		rr := st.refs[repoKey(w.ref)]
@@ -318,8 +336,9 @@ func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
 		if st.done[k] != nil || cands[k] != nil {
 			continue
 		}
-		cands[k] = &candidate{tag: t}
 		pinned := ref.Ref{Kind: w.ref.Kind, Owner: w.ref.Owner, Repo: w.ref.Repo, Path: w.ref.Path, Ref: t.SHA}
+		cands[k] = &candidate{tag: t}
+		keys[k] = pinned
 		probes = append(probes, scan.Root{Name: k, Owner: w.owner, Files: []scan.File{probe(pinned)}})
 	}
 	if len(probes) == 0 {
@@ -333,13 +352,23 @@ func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
 	if err != nil {
 		return err
 	}
+	// A path missing from a version is reported as removed, so the generic
+	// warning about it is dropped.
+	var gone []string
 	for k, c := range cands {
 		c.unverified = res.Incomplete[k]
 		c.clean = !c.unverified
+		r := keys[k]
+		if res.NotFound[r.Key()] {
+			c.removed = true
+			gone = append(gone, r.Owner+"/"+r.Repo+"@"+r.Ref+": none of ")
+		}
 		st.done[k] = c
 	}
 	for _, w := range res.Warnings {
-		p.Warnings = append(p.Warnings, "checking upgrades: "+w)
+		if !slices.ContainsFunc(gone, func(prefix string) bool { return strings.HasPrefix(w, prefix) }) {
+			p.Warnings = append(p.Warnings, "checking upgrades: "+w)
+		}
 	}
 	for _, f := range res.Findings {
 		if c := cands[f.Repo]; c != nil {
@@ -389,12 +418,16 @@ func describe(it *Item, root scan.Root, g *group, st *state) {
 			it.Fix += fmt.Sprintf(" (major version change from %s)", cur)
 		}
 
+	case c != nil && c.removed:
+		it.FixKind = None
+		it.Fix, it.Reason = noFix(g.ref, c, nested[0].Uses)
+
 	case sameOwner(root.Owner, g.ref):
 		describeUpstream(it, g, st)
 
 	default:
 		it.FixKind = None
-		it.Fix = noFix(g.ref, c, nested[0].Uses)
+		it.Fix, it.Reason = noFix(g.ref, c, nested[0].Uses)
 	}
 }
 
@@ -439,8 +472,11 @@ func describeUpstream(it *Item, g *group, st *state) {
 			if c := st.release(b); c != nil && c.clean {
 				s = fmt.Sprintf("Upgrade %s to %s@%s # %s", at, b.Name(), c.tag.SHA, c.tag.Name)
 			} else {
-				it.FixKind = None
-				s = at + ": " + noFix(b, c, f.Uses)
+				why, reason := noFix(b, c, f.Uses)
+				if it.FixKind != None {
+					it.FixKind, it.Reason = None, reason
+				}
+				s = at + ": " + why
 			}
 		}
 		if !seen[s] {
@@ -456,14 +492,16 @@ func describeUpstream(it *Item, g *group, st *state) {
 
 // noFix explains why r has no fix: c is its newest release, or nil when it
 // has none, and uses is an unpinned reference inside it.
-func noFix(r ref.Ref, c *candidate, uses string) string {
+func noFix(r ref.Ref, c *candidate, uses string) (string, Reason) {
 	switch {
+	case c != nil && c.removed:
+		return fmt.Sprintf("%s no longer exists in %s; migrate to its replacement", r.Name(), c.tag.Name), Removed
 	case c != nil && c.blocker == "" && c.unverified:
-		return fmt.Sprintf("No verified fix: could not read all of latest release %s to check it (see warnings)", c.tag.Name)
+		return fmt.Sprintf("No verified fix: could not read all of latest release %s to check it (see warnings)", c.tag.Name), Unverified
 	case c == nil:
-		return fmt.Sprintf("No fix upstream yet: %s has no releases and uses %s unpinned; fork it or ask upstream to pin", r.Name(), uses)
+		return fmt.Sprintf("No fix upstream yet: %s has no releases and uses %s unpinned; fork it or ask upstream to pin", r.Name(), uses), NoUpstreamFix
 	}
-	return fmt.Sprintf("No fix upstream yet: latest release %s still uses %s; fork it or ask upstream to pin", c.tag.Name, c.blocker)
+	return fmt.Sprintf("No fix upstream yet: latest release %s still uses %s; fork it or ask upstream to pin", c.tag.Name, c.blocker), NoUpstreamFix
 }
 
 // current returns the version in use: the ref itself, or the comment next to

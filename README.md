@@ -58,11 +58,14 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 | Pin `<ref>` in `<file>:<line> on <branch>`, then update this reference | A same-owner dependency is fully pinned in neither its newest release nor its default branch, so the refs inside it have to be pinned. The locations are on its default branch, where the edit goes. When the unpinned ref is inside a third-party action that the dependency calls, the step is instead to upgrade that action there, or there's no fix upstream yet. |
 | No fix upstream yet | Even the newest release still uses unpinned refs: fork it, replace it, or ask upstream to pin. |
 | No verified fix | Part of the newest release couldn't be read, so it isn't known to be fully pinned. The warnings say what failed. |
+| `<action>` no longer exists in `<version>` | The action's path is gone from the newest release, e.g. it moved or was retired: migrate to its replacement. |
 
 A repository shows `None (incomplete, see warnings)` instead of `None` when some refs couldn't be read, couldn't be parsed or were beyond `--depth`, so it isn't known to be fine. The summary, warnings and API cost go to stderr. When piped, the table is tab-separated without a header. `--json` also gives each item's file and line, and the full chain of findings behind it. For each finding:
 - `external` says whether the unpinned action belongs to another owner;
 - `source_owner` and `source_external` say who owns the file it's written in;
 - `boundary` is the reference to change to fix it, in a file the repository's owner controls.
+
+An item whose `fix_kind` is `none` has a `reason`: `no-upstream-fix`, `unverified` or `removed`.
 
 ## Exit status
 
