@@ -54,6 +54,7 @@ example/app     cli/gh-extension-precompile@ee3e4e5 (v1)  Upgrade to cli/gh-exte
 |---|---|
 | Pin to `<action>@<sha> # <version>` | The ref itself is unpinned and everything it uses is pinned. The SHA is the commit the current version points at, so behavior doesn't change. |
 | Upgrade to `<action>@<sha> # <version>` | The dependency uses unpinned refs, and its newest release (by version tag) is fully pinned. This applies to dependencies of the same owner too. Marked when the major version changes. |
+| Update to `<action>@<sha> # <branch>` | The ref follows a branch, e.g. `@main` or a SHA commented `# main`, and that branch's head is now fully pinned. It keeps following the same branch. |
 | Release `<action>` from `<branch>` at `<sha>`, then upgrade to it | A same-owner dependency's newest release isn't fully pinned, but its default branch is, so it only needs a release. |
 | Pin `<ref>` in `<file>:<line> on <branch>`, then update this reference | A same-owner dependency is fully pinned in neither its newest release nor its default branch, so the refs inside it have to be pinned. The locations are on its default branch, where the edit goes. When the unpinned ref is inside a third-party action that the dependency calls, the step is instead to upgrade that action there, or there's no fix upstream yet. |
 | No fix upstream yet | Even the newest release still uses unpinned refs: fork it, replace it, or ask upstream to pin. |
@@ -64,6 +65,8 @@ A repository shows `None (incomplete, see warnings)` instead of `None` when some
 - `external` says whether the unpinned action belongs to another owner;
 - `source_owner` and `source_external` say who owns the file it's written in;
 - `boundary` is the reference to change to fix it, in a file the repository's owner controls.
+
+A ref that follows a branch is named in the fix: "on branch `<name>`", plus a release tag to consider when it's only pinned to the branch's head. If the branch head still has unpinned refs but the newest release doesn't, the fix is to upgrade to the release ("currently on branch `<name>`"). A name counts as a branch only when the repository has a branch and no tag of that name; a comment counts only when it's exactly one name that isn't a version.
 
 An item whose `fix_kind` is `none` has a `reason`: `no-upstream-fix`, `unverified` or `removed`.
 

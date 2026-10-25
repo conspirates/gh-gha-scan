@@ -56,11 +56,13 @@ func TestCommitPeelsTags(t *testing.T) {
 }
 
 func TestTagsQuery(t *testing.T) {
-	q := tagsQuery([]string{"actions/checkout", "o/r"})
+	q := tagsQuery([]string{"actions/checkout", "o/r"}, map[string][]string{"o/r": {"main"}})
 	for _, want := range []string{
 		`t0: repository(owner: "actions", name: "checkout")`,
 		`t1: repository(owner: "o", name: "r")`,
 		`defaultBranchRef { name target { oid } }`,
+		`b0: ref(qualifiedName: "refs/heads/main") { target { oid } }`,
+		`x0: ref(qualifiedName: "refs/tags/main") { name }`,
 		`refs(refPrefix: "refs/tags/", first: 50, orderBy: {field: TAG_COMMIT_DATE, direction: DESC})`,
 	} {
 		if !strings.Contains(q, want) {

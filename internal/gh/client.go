@@ -425,20 +425,17 @@ func (c *Client) WorkflowStates(ctx context.Context, repo string) (map[string]st
 
 // Refs implements fix.RefLister with batched GraphQL queries. Repositories
 // that cannot be read have no entry.
-func (c *Client) Refs(ctx context.Context, repos []string) (map[string]fix.RepoRefs, error) {
+func (c *Client) Refs(ctx context.Context, repos map[string][]string) (map[string]fix.RepoRefs, error) {
+	names := make([]string, 0, len(repos))
+	for r := range repos {
+		names = append(names, r)
+	}
+	sort.Strings(names)
 	out := map[string]fix.RepoRefs{}
-	for start := 0; start < len(repos); start += BatchSize {
-		chunk := repos[start:min(start+BatchSize, len(repos))]
-		var resp map[string]*struct {
-			DefaultBranchRef *struct {
-				Name   string `json:"name"`
-				Target object `json:"target"`
-			} `json:"defaultBranchRef"`
-			Refs struct {
-				Nodes []tagNode `json:"nodes"`
-			} `json:"refs"`
-		}
-		err := c.do(ctx, tagsQuery(chunk), nil, &resp)
+	for start := 0; start < len(names); start += BatchSize {
+		chunk := names[start:min(start+BatchSize, len(names))]
+		var resp map[string]map[string]json.RawMessage
+		err := c.do(ctx, tagsQuery(chunk, repos), nil, &resp)
 		if _, err := notFound(err); err != nil {
 			return nil, err
 		}
@@ -447,12 +444,34 @@ func (c *Client) Refs(ctx context.Context, repos []string) (map[string]fix.RepoR
 			if repo == nil {
 				continue
 			}
-			var rr fix.RepoRefs
-			if d := repo.DefaultBranchRef; d != nil {
-				rr.Default = fix.Tag{Name: d.Name, SHA: d.Target.OID}
+			var def *struct {
+				Name   string `json:"name"`
+				Target object `json:"target"`
 			}
-			for _, n := range repo.Refs.Nodes {
+			var tags struct {
+				Nodes []tagNode `json:"nodes"`
+			}
+			_ = json.Unmarshal(repo["defaultBranchRef"], &def)
+			_ = json.Unmarshal(repo["refs"], &tags)
+			var rr fix.RepoRefs
+			if def != nil {
+				rr.Default = fix.Tag{Name: def.Name, SHA: def.Target.OID}
+			}
+			for _, n := range tags.Nodes {
 				rr.Tags = append(rr.Tags, fix.Tag{Name: n.Name, SHA: n.Target.commit()})
+			}
+			for j, name := range repos[r] {
+				var head, tag *struct {
+					Target object `json:"target"`
+				}
+				_ = json.Unmarshal(repo[fmt.Sprintf("b%d", j)], &head)
+				_ = json.Unmarshal(repo[fmt.Sprintf("x%d", j)], &tag)
+				if head != nil && tag == nil {
+					if rr.Branches == nil {
+						rr.Branches = map[string]string{}
+					}
+					rr.Branches[name] = head.Target.OID
+				}
 			}
 			out[strings.ToLower(r)] = rr
 		}

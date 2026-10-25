@@ -5,6 +5,7 @@ package fix
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -27,13 +28,17 @@ type RepoRefs struct {
 	Tags []Tag
 	// Default is the default branch, by name, and its head commit.
 	Default Tag
+	// Branches maps each requested name that is a branch, and not also a
+	// tag, to its head commit.
+	Branches map[string]string
 }
 
-// RefLister looks up the refs of repositories (owner/repo), keyed by
-// lowercase owner/repo. Repositories that cannot be read have no entry.
-// Implementations should batch requests.
+// RefLister looks up the refs of repositories, keyed by lowercase
+// owner/repo. repos maps each repository to the branch names to look up.
+// Repositories that cannot be read have no entry. Implementations should
+// batch requests.
 type RefLister interface {
-	Refs(ctx context.Context, repos []string) (map[string]RepoRefs, error)
+	Refs(ctx context.Context, repos map[string][]string) (map[string]RepoRefs, error)
 }
 
 // Kind classifies a suggested fix.
@@ -226,6 +231,20 @@ func (st *state) head(r ref.Ref) *candidate {
 	return st.done[versionKey(r, d.SHA)]
 }
 
+// branch returns the branch g's reference follows and its head commit, or
+// "" when it is not on a branch.
+func (st *state) branch(g *group) (name, head string) {
+	name = branchName(g)
+	if name == "" {
+		return "", ""
+	}
+	head, ok := st.refs[repoKey(g.ref)].Branches[name]
+	if !ok {
+		return "", ""
+	}
+	return name, head
+}
+
 // upstream returns the unpinned references inside g's same-owner dependency
 // where they have to be fixed: on its default branch when that could be
 // read, otherwise at the commit in use.
@@ -241,6 +260,8 @@ type wanted struct {
 	ref ref.Ref
 	// head asks for the default branch head instead of the latest release.
 	head bool
+	// branch asks for the head of this branch instead.
+	branch string
 	// owner is the scanned repository's owner, so that findings inside a
 	// same-owner dependency know which files that owner controls.
 	owner string
@@ -259,6 +280,25 @@ func (p *Planner) check(ctx context.Context, roots []scan.Root, index map[string
 	}
 	ownerOf := func(k string) string { return owners[k[:strings.IndexByte(k, 0)]] }
 
+	// Look up every dependency that needs a fix checked, and every
+	// reference that may be on a branch, in one batch.
+	lookup := map[string][]string{}
+	for _, g := range index {
+		name := branchName(g)
+		if len(transitive(g.findings)) == 0 && name == "" {
+			continue
+		}
+		k := repoKey(g.ref)
+		if name != "" && !slices.Contains(lookup[k], name) {
+			lookup[k] = append(lookup[k], name)
+		} else if _, ok := lookup[k]; !ok {
+			lookup[k] = nil
+		}
+	}
+	if err := p.lookup(ctx, st, lookup); err != nil {
+		return nil, err
+	}
+
 	var ws []wanted
 	for k, g := range index {
 		if len(transitive(g.findings)) == 0 {
@@ -268,6 +308,9 @@ func (p *Planner) check(ctx context.Context, roots []scan.Root, index map[string
 		ws = append(ws, wanted{ref: g.ref, owner: owner})
 		if sameOwner(owner, g.ref) {
 			ws = append(ws, wanted{ref: g.ref, head: true, owner: owner})
+		}
+		if name, _ := st.branch(g); name != "" {
+			ws = append(ws, wanted{ref: g.ref, branch: name, owner: owner})
 		}
 	}
 	if err := p.verify(ctx, st, ws); err != nil {
@@ -302,22 +345,12 @@ func (p *Planner) check(ctx context.Context, roots []scan.Root, index map[string
 // verify looks up the refs of repositories not seen yet, then scans every
 // wanted version not checked yet, all in one scan.
 func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
-	var repos []string
+	repos := map[string][]string{}
 	for _, w := range ws {
-		k := repoKey(w.ref)
-		if _, ok := st.refs[k]; !ok && !slices.Contains(repos, k) {
-			repos = append(repos, k)
-		}
+		repos[repoKey(w.ref)] = nil
 	}
-	if len(repos) > 0 {
-		sort.Strings(repos)
-		got, err := p.Refs.Refs(ctx, repos)
-		if err != nil {
-			return err
-		}
-		for _, k := range repos {
-			st.refs[k] = got[k]
-		}
+	if err := p.lookup(ctx, st, repos); err != nil {
+		return err
 	}
 
 	cands := map[string]*candidate{}
@@ -325,8 +358,13 @@ func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
 	var probes []scan.Root
 	for _, w := range ws {
 		rr := st.refs[repoKey(w.ref)]
-		t := rr.Default
-		if !w.head {
+		var t Tag
+		switch {
+		case w.branch != "":
+			t = Tag{Name: w.branch, SHA: rr.Branches[w.branch]}
+		case w.head:
+			t = rr.Default
+		default:
 			t, _ = Latest(rr.Tags)
 		}
 		if t.SHA == "" {
@@ -382,6 +420,47 @@ func (p *Planner) verify(ctx context.Context, st *state, ws []wanted) error {
 	return nil
 }
 
+// lookup fetches the refs of repositories not looked up yet, with the branch
+// names to check in each.
+func (p *Planner) lookup(ctx context.Context, st *state, repos map[string][]string) error {
+	for k := range repos {
+		if _, ok := st.refs[k]; ok {
+			delete(repos, k)
+		}
+	}
+	if len(repos) == 0 {
+		return nil
+	}
+	got, err := p.Refs.Refs(ctx, repos)
+	if err != nil {
+		return err
+	}
+	for k := range repos {
+		st.refs[k] = got[k]
+	}
+	return nil
+}
+
+// branchRE matches a plausible branch name.
+var branchRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+
+// branchName returns the name of the branch g's reference may follow: its
+// ref when unpinned, or a pinned SHA's comment when that is exactly one
+// name and not a version. Whether it is a branch is looked up.
+func branchName(g *group) string {
+	name := g.ref.Ref
+	if g.ref.IsPinned() {
+		name = g.direct.Comment
+		if _, ok := parseVersion(name); ok {
+			return ""
+		}
+	}
+	if !branchRE.MatchString(name) {
+		return ""
+	}
+	return name
+}
+
 // probe is a workflow that calls r, used to scan a candidate release.
 func probe(r ref.Ref) scan.File {
 	uses := r.Name() + "@" + r.Ref
@@ -399,6 +478,33 @@ func sameOwner(owner string, r ref.Ref) bool {
 func describe(it *Item, root scan.Root, g *group, st *state) {
 	nested := transitive(g.findings)
 	c := st.release(g.ref)
+	// A reference on a branch first tries to stay on it, then moves to a
+	// release; either way the branch is named.
+	branch, head := st.branch(g)
+	var bh *candidate
+	if branch != "" {
+		bh = st.done[versionKey(g.ref, head)]
+	}
+	hint := ""
+	if t, ok := Latest(st.refs[repoKey(g.ref)].Tags); ok {
+		hint = "consider a release tag such as " + t.Name
+	}
+	note := func(parts ...string) {
+		var ps []string
+		for _, p := range parts {
+			if p != "" {
+				ps = append(ps, p)
+			}
+		}
+		if len(ps) > 0 {
+			it.Fix += " (" + strings.Join(ps, "; ") + ")"
+		}
+	}
+	onBranch := ""
+	if branch != "" {
+		onBranch = "on branch " + branch
+	}
+
 	switch {
 	case len(nested) == 0:
 		it.FixKind = Pin
@@ -409,25 +515,40 @@ func describe(it *Item, root scan.Root, g *group, st *state) {
 		}
 		it.Replacement = fmt.Sprintf("%s@%s # %s", g.ref.Name(), sha, g.ref.Ref)
 		it.Fix = "Pin to " + it.Replacement
+		if onBranch != "" {
+			note(onBranch, hint)
+		}
+
+	case bh != nil && bh.clean:
+		it.FixKind = Upgrade
+		it.Replacement = fmt.Sprintf("%s@%s # %s", g.ref.Name(), head, branch)
+		it.Fix = "Update to " + it.Replacement
+		note(hint)
 
 	case c != nil && c.clean:
 		it.FixKind = Upgrade
 		it.Replacement = fmt.Sprintf("%s@%s # %s", g.ref.Name(), c.tag.SHA, c.tag.Name)
 		it.Fix = "Upgrade to " + it.Replacement
-		if cur := current(g); cur != "" && major(cur) >= 0 && major(c.tag.Name) >= 0 && major(cur) != major(c.tag.Name) {
-			it.Fix += fmt.Sprintf(" (major version change from %s)", cur)
+		switch cur := current(g); {
+		case branch != "":
+			note("currently on branch " + branch)
+		case cur != "" && major(cur) >= 0 && major(c.tag.Name) >= 0 && major(cur) != major(c.tag.Name):
+			note("major version change from " + cur)
 		}
 
 	case c != nil && c.removed:
 		it.FixKind = None
 		it.Fix, it.Reason = noFix(g.ref, c, nested[0].Uses)
+		note(onBranch)
 
 	case sameOwner(root.Owner, g.ref):
 		describeUpstream(it, g, st)
+		note(onBranch)
 
 	default:
 		it.FixKind = None
 		it.Fix, it.Reason = noFix(g.ref, c, nested[0].Uses)
+		note(onBranch)
 	}
 }
 

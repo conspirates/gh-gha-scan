@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/conspirates/gh-gha-scan/internal/ref"
 	"github.com/conspirates/gh-gha-scan/internal/scan"
 )
 
@@ -41,9 +42,9 @@ func (f fakeFetcher) Fetch(_ context.Context, reqs map[string]scan.FileReq) (map
 // fakeTags serves tags only, with no default branch.
 type fakeTags map[string][]Tag
 
-func (f fakeTags) Refs(_ context.Context, repos []string) (map[string]RepoRefs, error) {
+func (f fakeTags) Refs(_ context.Context, repos map[string][]string) (map[string]RepoRefs, error) {
 	out := map[string]RepoRefs{}
-	for _, r := range repos {
+	for r := range repos {
 		if ts, ok := f[r]; ok {
 			out[r] = RepoRefs{Tags: ts}
 		}
@@ -51,15 +52,27 @@ func (f fakeTags) Refs(_ context.Context, repos []string) (map[string]RepoRefs, 
 	return out, nil
 }
 
-// fakeRefs serves tags and default branches.
+// fakeRefs serves tags, default branches, and the branches asked for.
 type fakeRefs map[string]RepoRefs
 
-func (f fakeRefs) Refs(_ context.Context, repos []string) (map[string]RepoRefs, error) {
+func (f fakeRefs) Refs(_ context.Context, repos map[string][]string) (map[string]RepoRefs, error) {
 	out := map[string]RepoRefs{}
-	for _, r := range repos {
-		if rr, ok := f[r]; ok {
-			out[r] = rr
+	for r, names := range repos {
+		rr, ok := f[r]
+		if !ok {
+			continue
 		}
+		branches := rr.Branches
+		rr.Branches = nil
+		for _, n := range names {
+			if sha, ok := branches[n]; ok {
+				if rr.Branches == nil {
+					rr.Branches = map[string]string{}
+				}
+				rr.Branches[n] = sha
+			}
+		}
+		out[r] = rr
 	}
 	return out, nil
 }
@@ -349,5 +362,86 @@ func TestPathRemovedInLatestRelease(t *testing.T) {
 	}
 	if len(p.Warnings) != 0 {
 		t.Errorf("warnings = %v, want none: the removal is the fix", p.Warnings)
+	}
+}
+
+func TestBranchRefs(t *testing.T) {
+	const app = "me/app"
+	tests := []struct {
+		name  string
+		uses  string
+		fetch fakeFetcher
+		want  string
+		kind  Kind
+	}{{
+		name:  "1: unpinned branch with nothing unpinned underneath stays pinned to it",
+		uses:  "up/action@main",
+		fetch: fakeFetcher{"up/action/@main": {}},
+		want:  "Pin to up/action@sha-of-main # main (on branch main; consider a release tag such as v2.0.0)",
+		kind:  Pin,
+	}, {
+		name: "2: branch head is now fully pinned",
+		uses: "up/action@" + shaV1 + " # main",
+		fetch: fakeFetcher{
+			"up/action/@" + shaV1: {"x/x@v1"},
+			"up/action/@" + shaV2: {},
+			"up/action/@" + shaV3: {},
+			"x/x/@v1":             {},
+		},
+		want: "Update to up/action@" + shaV3 + " # main (consider a release tag such as v2.0.0)",
+		kind: Upgrade,
+	}, {
+		name: "3: stale branch, latest release is fully pinned",
+		uses: "up/action@" + shaV1 + " # main",
+		fetch: fakeFetcher{
+			"up/action/@" + shaV1: {"x/x@v1"},
+			"up/action/@" + shaV2: {},
+			"up/action/@" + shaV3: {"x/x@v1"},
+			"x/x/@v1":             {},
+		},
+		want: "Upgrade to up/action@" + shaV2 + " # v2.0.0 (currently on branch main)",
+		kind: Upgrade,
+	}, {
+		name: "4: neither is fully pinned",
+		uses: "up/action@" + shaV1 + " # main",
+		fetch: fakeFetcher{
+			"up/action/@" + shaV1: {"x/x@v1"},
+			"up/action/@" + shaV2: {"x/x@v1"},
+			"up/action/@" + shaV3: {"x/x@v1"},
+			"x/x/@v1":             {},
+		},
+		want: "No fix upstream yet: latest release v2.0.0 still uses x/x@v1; fork it or ask upstream to pin (on branch main)",
+		kind: None,
+	}}
+	refs := fakeRefs{"up/action": {Tags: []Tag{{"v2.0.0", shaV2}}, Branches: map[string]string{"main": shaV3}}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			it := only(t, plan(t, tt.fetch, refs, scan.Root{Name: app, Owner: "me", Files: []scan.File{workflow(tt.uses)}}))
+			if it.FixKind != tt.kind || it.Fix != tt.want {
+				t.Errorf("got %s: %q\nwant %s: %q", it.FixKind, it.Fix, tt.kind, tt.want)
+			}
+		})
+	}
+}
+
+func TestBranchName(t *testing.T) {
+	tests := map[string]string{
+		"up/action@main":                 "main",
+		"up/action@release/v2":           "release/v2",
+		"up/action@" + shaV1 + " # main": "main",
+		// Only a comment that is exactly one name is taken as a ref.
+		"up/action@" + shaV1 + " # main branch":    "",
+		"up/action@" + shaV1 + " # pinned 2026-03": "",
+		// Versions are tags, not branches.
+		"up/action@" + shaV1 + " # v4":     "",
+		"up/action@" + shaV1 + " # v4.1.0": "",
+		"up/action@" + shaV1:               "",
+	}
+	for uses, want := range tests {
+		value, comment, _ := strings.Cut(uses, " # ")
+		g := &group{direct: scan.Direct{Uses: value, Comment: comment}, ref: ref.Parse(value)}
+		if got := branchName(g); got != want {
+			t.Errorf("branchName(%q) = %q, want %q", uses, got, want)
+		}
 	}
 }

@@ -99,8 +99,9 @@ func batchQuery(reqs []scan.FileReq) string {
 const TagsPerRepo = 50
 
 // tagsQuery lists the default branch and recent tags of repos (owner/repo),
-// aliased tN.
-func tagsQuery(repos []string) string {
+// aliased tN. For each name in branches[repo] it also asks for the branch,
+// aliased bM, and for a tag of the same name, aliased xM.
+func tagsQuery(repos []string, branches map[string][]string) string {
 	var b strings.Builder
 	b.WriteString("query {\n  " + rateLimitField + "\n")
 	for i, r := range repos {
@@ -109,7 +110,12 @@ func tagsQuery(repos []string) string {
 		b.WriteString("    defaultBranchRef { name target { oid } }\n")
 		fmt.Fprintf(&b, "    refs(refPrefix: \"refs/tags/\", first: %d, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {\n", TagsPerRepo)
 		b.WriteString("      nodes { name target { oid ... on Tag { target { oid ... on Tag { target { oid } } } } } }\n")
-		b.WriteString("    }\n  }\n")
+		b.WriteString("    }\n")
+		for j, name := range branches[r] {
+			fmt.Fprintf(&b, "    b%d: ref(qualifiedName: %s) { target { oid } }\n", j, quote("refs/heads/"+name))
+			fmt.Fprintf(&b, "    x%d: ref(qualifiedName: %s) { name }\n", j, quote("refs/tags/"+name))
+		}
+		b.WriteString("  }\n")
 	}
 	b.WriteString("}\n")
 	return b.String()

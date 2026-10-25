@@ -13,6 +13,7 @@ import (
 
 	"github.com/cli/go-gh/v2/pkg/api"
 
+	"github.com/conspirates/gh-gha-scan/internal/fix"
 	"github.com/conspirates/gh-gha-scan/internal/scan"
 )
 
@@ -139,5 +140,30 @@ func TestOwnerReposFetchesOnlyUncachedCommits(t *testing.T) {
 	}
 	if f, ok := roots.Files("o/changed", "c2"); !ok || !reflect.DeepEqual(f, changed) {
 		t.Errorf("o/changed@c2 not stored in the cache: %v %v", f, ok)
+	}
+}
+
+func TestRefsTellsBranchesFromTags(t *testing.T) {
+	// "main" is only a branch; "v1" is both a branch and a tag, so it is
+	// taken as the tag.
+	const resp = `{"data":{"rateLimit":{"cost":1,"remaining":4999},"t0":{
+		"defaultBranchRef":{"name":"main","target":{"oid":"d1"}},
+		"refs":{"nodes":[{"name":"v1","target":{"oid":"t1"}}]},
+		"b0":{"target":{"oid":"h0"}},"x0":null,
+		"b1":{"target":{"oid":"h1"}},"x1":{"name":"v1"}}}}`
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(resp))
+	})
+	got, err := c.Refs(context.Background(), map[string][]string{"o/r": {"main", "v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := got["o/r"]
+	if rr.Default != (fix.Tag{Name: "main", SHA: "d1"}) || len(rr.Tags) != 1 {
+		t.Errorf("default = %+v, tags = %+v", rr.Default, rr.Tags)
+	}
+	if want := map[string]string{"main": "h0"}; !reflect.DeepEqual(rr.Branches, want) {
+		t.Errorf("branches = %v, want %v", rr.Branches, want)
 	}
 }
